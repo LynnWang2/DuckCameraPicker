@@ -6,114 +6,87 @@ import '../models/picked_color.dart';
 import '../state/app_state.dart';
 import '../theme/duck_theme.dart';
 
-/// 取色历史页：全部取色记录，点按复制色值。
+/// 取色历史页：全部取色记录，点按复制色值（复制格式跟随“显示格式”设置）。
 class HistoryScreen extends StatelessWidget {
   const HistoryScreen({super.key});
-
-  void _confirmClear(BuildContext context, AppState state) {
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        title: const Text('清空历史', style: TextStyle(fontSize: 17)),
-        content: const Text('确定要删除全部取色记录吗？', style: TextStyle(fontSize: 14)),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(context).pop(),
-            child: const Text('取消'),
-          ),
-          TextButton(
-            onPressed: () {
-              state.clearHistory();
-              Navigator.of(context).pop();
-            },
-            child: const Text('清空', style: TextStyle(color: Colors.red)),
-          ),
-        ],
-      ),
-    );
-  }
 
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
-    final dark = Theme.of(context).brightness == Brightness.dark;
-    final textColor = dark ? DuckColors.textDark : DuckColors.textLight;
-    final mutedColor = dark ? DuckColors.mutedDark : DuckColors.mutedLight;
-    return SafeArea(
-      bottom: false,
-      child: ListView(
-        padding: const EdgeInsets.fromLTRB(20, 12, 20, 140),
-        children: [
-          Row(
-            children: [
-              Text(
-                '取色历史',
-                style: TextStyle(
-                  fontSize: 24,
-                  fontWeight: FontWeight.w800,
-                  color: textColor,
-                ),
-              ),
-              const SizedBox(width: 8),
-              Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 9, vertical: 3),
-                decoration: BoxDecoration(
-                  color: DuckColors.accent.withValues(alpha: 0.22),
-                  borderRadius: BorderRadius.circular(11),
-                ),
-                child: Text(
-                  '${state.history.length}',
-                  style: const TextStyle(
-                    fontSize: 13,
-                    fontWeight: FontWeight.w700,
-                    color: DuckColors.pickEnd,
-                  ),
-                ),
-              ),
-              const Spacer(),
-              if (state.history.isNotEmpty)
-                TextButton(
-                  onPressed: () => _confirmClear(context, state),
-                  child: Text('清空', style: TextStyle(color: mutedColor)),
-                ),
-            ],
+    final history = state.history;
+    final bottomPad = MediaQuery.of(context).padding.bottom;
+    return Scaffold(
+      backgroundColor: Colors.transparent,
+      appBar: AppBar(
+        title: const Text('取色历史'),
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        centerTitle: true,
+        actions: [
+          if (history.isNotEmpty)
+            IconButton(
+              icon: const Icon(Icons.delete_outline_rounded),
+              onPressed: () => _confirmClear(context, state),
+              tooltip: '清空历史',
+            ),
+        ],
+      ),
+      body: history.isEmpty
+          ? const _EmptyHint()
+          : ListView.separated(
+              padding: EdgeInsets.fromLTRB(16, 8, 16, bottomPad + 110),
+              itemCount: history.length,
+              separatorBuilder: (_, __) => const SizedBox(height: 12),
+              itemBuilder: (context, i) =>
+                  _HistoryRow(color: history[i], key: ValueKey(history[i].id)),
+            ),
+    );
+  }
+
+  Future<void> _confirmClear(BuildContext context, AppState state) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('清空历史'),
+        content: const Text('确定要删除全部取色记录吗？'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('取消'),
           ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('清空'),
+          ),
+        ],
+      ),
+    );
+    if (ok == true) state.clearHistory();
+  }
+}
+
+class _EmptyHint extends StatelessWidget {
+  const _EmptyHint();
+
+  @override
+  Widget build(BuildContext context) {
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    final muted = dark ? DuckColors.mutedDark : DuckColors.mutedLight;
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.palette_outlined, size: 56, color: muted),
           const SizedBox(height: 12),
-          if (state.history.isEmpty)
-            Padding(
-              padding: const EdgeInsets.only(top: 72),
-              child: Center(
-                child: Column(
-                  children: [
-                    Icon(
-                      Icons.colorize_rounded,
-                      size: 52,
-                      color: mutedColor.withValues(alpha: 0.5),
-                    ),
-                    const SizedBox(height: 12),
-                    Text(
-                      '还没有取色记录',
-                      style: TextStyle(fontSize: 15, color: mutedColor),
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      '点底部中间的按钮开始取色吧',
-                      style: TextStyle(fontSize: 13, color: mutedColor),
-                    ),
-                  ],
-                ),
-              ),
-            )
-          else
-            for (final c in state.history)
-              _HistoryRow(
-                color: c,
-                dark: dark,
-                textColor: textColor,
-                mutedColor: mutedColor,
-              ),
+          Text(
+            '还没有取色记录',
+            style: TextStyle(color: muted, fontSize: 15),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            '去相机页取个颜色，点保存就进来啦',
+            style: TextStyle(color: muted, fontSize: 13),
+          ),
         ],
       ),
     );
@@ -121,102 +94,96 @@ class HistoryScreen extends StatelessWidget {
 }
 
 class _HistoryRow extends StatelessWidget {
-  const _HistoryRow({
-    required this.color,
-    required this.dark,
-    required this.textColor,
-    required this.mutedColor,
-  });
+  const _HistoryRow({super.key, required this.color});
 
   final PickedColor color;
-  final bool dark;
-  final Color textColor;
-  final Color mutedColor;
-
-  String get _time {
-    final t = color.createdAt;
-    String two(int n) => n.toString().padLeft(2, '0');
-    return '${two(t.month)}-${two(t.day)} ${two(t.hour)}:${two(t.minute)}';
-  }
 
   @override
   Widget build(BuildContext context) {
-    final state = context.read<AppState>();
-    return Container(
-      margin: const EdgeInsets.only(bottom: 10),
-      decoration: BoxDecoration(
-        color: dark ? DuckColors.cardDark : Colors.white,
-        borderRadius: BorderRadius.circular(17),
-        border: Border.all(
-          color: dark ? DuckColors.lineDark : DuckColors.lineLight,
+    final state = context.watch<AppState>();
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    final text = dark ? DuckColors.textDark : DuckColors.textLight;
+    final muted = dark ? DuckColors.mutedDark : DuckColors.mutedLight;
+    return Dismissible(
+      key: ValueKey(color.id),
+      direction: DismissDirection.endToStart,
+      background: Container(
+        alignment: Alignment.centerRight,
+        padding: const EdgeInsets.only(right: 20),
+        decoration: BoxDecoration(
+          color: Colors.red.shade400,
+          borderRadius: BorderRadius.circular(DuckColors.cardRadius),
         ),
+        child: const Icon(Icons.delete_outline_rounded,
+            color: Colors.white, size: 22),
       ),
-      child: Material(
-        color: Colors.transparent,
-        child: InkWell(
-          borderRadius: BorderRadius.circular(17),
-          onTap: () {
-            Clipboard.setData(
-                ClipboardData(text: color.valueFor(state.copyFormat)));
+      onDismissed: (_) => state.removeColor(color.id),
+      child: GestureDetector(
+        onTap: () async {
+          final value = color.valueFor(state.displayFormat);
+          await Clipboard.setData(ClipboardData(text: value));
+          if (context.mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
-                content: Text('已复制 ${color.valueFor(state.copyFormat)}'),
+                content: Text('已复制 $value'),
                 behavior: SnackBarBehavior.floating,
                 duration: const Duration(seconds: 1),
               ),
             );
-          },
-          child: Padding(
-            padding: const EdgeInsets.all(12),
-            child: Row(
-              children: [
-                Container(
-                  width: 52,
-                  height: 52,
-                  decoration: BoxDecoration(
-                    color: color.color,
-                    borderRadius: BorderRadius.circular(15),
-                    border: Border.all(
-                      color: dark ? DuckColors.lineDark : DuckColors.lineLight,
+          }
+        },
+        child: Container(
+          padding: const EdgeInsets.all(14),
+          decoration: duckCardDecoration(dark),
+          child: Row(
+            children: [
+              Container(
+                width: 52,
+                height: 52,
+                decoration: BoxDecoration(
+                  color: color.color,
+                  borderRadius: BorderRadius.circular(14),
+                ),
+              ),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      color.name,
+                      style: TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w700,
+                        color: text,
+                      ),
                     ),
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        color.name,
-                        style: TextStyle(
-                          fontSize: 16,
-                          fontWeight: FontWeight.w700,
-                          color: textColor,
-                        ),
+                    const SizedBox(height: 2),
+                    Text(
+                      color.valueFor(state.displayFormat),
+                      style: TextStyle(
+                        fontSize: 13,
+                        color: muted,
+                        fontFamily: 'monospace',
+                        fontFamilyFallback: const ['Menlo', 'Consolas'],
                       ),
-                      const SizedBox(height: 2),
-                      Text(
-                        '${color.hexWithHash} · $_time',
-                        style: TextStyle(
-                          fontSize: 12,
-                          fontFamily: 'monospace',
-                          fontFamilyFallback: const ['Menlo', 'Consolas'],
-                          color: mutedColor,
-                        ),
-                      ),
-                    ],
-                  ),
+                    ),
+                  ],
                 ),
-                IconButton(
-                  icon: Icon(Icons.delete_outline_rounded,
-                      size: 20, color: mutedColor),
-                  onPressed: () => state.removeColor(color.id),
-                ),
-              ],
-            ),
+              ),
+              Text(
+                _formatTime(color.pickedAt),
+                style: TextStyle(fontSize: 12, color: muted),
+              ),
+            ],
           ),
         ),
       ),
     );
+  }
+
+  String _formatTime(DateTime t) {
+    String two(int n) => n.toString().padLeft(2, '0');
+    return '${two(t.month)}-${two(t.day)} ${two(t.hour)}:${two(t.minute)}';
   }
 }
