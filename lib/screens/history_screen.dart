@@ -172,7 +172,7 @@ class _HistoryRow extends StatelessWidget {
                 ),
               ),
               Text(
-                _formatTime(color.pickedAt),
+                _formatTime(color.createdAt),
                 style: TextStyle(fontSize: 12, color: muted),
               ),
             ],
