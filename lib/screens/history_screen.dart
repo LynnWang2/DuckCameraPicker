@@ -17,29 +17,35 @@ class HistoryScreen extends StatelessWidget {
     final bottomPad = MediaQuery.of(context).padding.bottom;
     return Scaffold(
       backgroundColor: Colors.transparent,
-      appBar: AppBar(
-        title: const Text('取色历史'),
-        backgroundColor: Colors.transparent,
-        elevation: 0,
-        centerTitle: true,
-        actions: [
-          if (history.isNotEmpty)
-            IconButton(
-              icon: const Icon(Icons.delete_outline_rounded),
-              onPressed: () => _confirmClear(context, state),
-              tooltip: '清空历史',
+      body: SafeArea(
+        child: Stack(
+          children: [
+            Positioned.fill(
+              child: history.isEmpty
+                  ? const _EmptyHint()
+                  : ListView.separated(
+                      padding:
+                          EdgeInsets.fromLTRB(16, 60, 16, bottomPad + 110),
+                      itemCount: history.length,
+                      separatorBuilder: (_, __) => const SizedBox(height: 12),
+                      itemBuilder: (context, i) => _HistoryRow(
+                          color: history[i], key: ValueKey(history[i].id)),
+                    ),
             ),
-        ],
+            // 顶部不再显示大字标题；清空按钮保留在右上角。
+            if (history.isNotEmpty)
+              Positioned(
+                top: 4,
+                right: 8,
+                child: IconButton(
+                  icon: const Icon(Icons.delete_outline_rounded),
+                  onPressed: () => _confirmClear(context, state),
+                  tooltip: '清空历史',
+                ),
+              ),
+          ],
+        ),
       ),
-      body: history.isEmpty
-          ? const _EmptyHint()
-          : ListView.separated(
-              padding: EdgeInsets.fromLTRB(16, 8, 16, bottomPad + 110),
-              itemCount: history.length,
-              separatorBuilder: (_, __) => const SizedBox(height: 12),
-              itemBuilder: (context, i) =>
-                  _HistoryRow(color: history[i], key: ValueKey(history[i].id)),
-            ),
     );
   }
 
@@ -120,7 +126,8 @@ class _HistoryRow extends StatelessWidget {
       onDismissed: (_) => state.removeColor(color.id),
       child: GestureDetector(
         onTap: () async {
-          final value = color.valueFor(state.displayFormat);
+          final value = color.valueForCopy(state.displayFormat,
+              stripHash: state.stripHashOnCopy);
           await Clipboard.setData(ClipboardData(text: value));
           if (context.mounted) {
             ScaffoldMessenger.of(context).showSnackBar(

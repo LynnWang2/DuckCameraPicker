@@ -1,13 +1,30 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../models/picked_color.dart';
 import '../state/app_state.dart';
 import '../theme/duck_theme.dart';
 
-/// 我的页：应用图标与名称、取色设置、关于。
+/// 我的页：应用图标与名称、取色设置。
 class ProfileScreen extends StatelessWidget {
   const ProfileScreen({super.key});
+
+  static final _githubUri =
+      Uri.parse('https://github.com/LynnWang2/DuckCameraPicker');
+
+  Future<void> _openGithub(BuildContext context) async {
+    final ok = await launchUrl(_githubUri, mode: LaunchMode.externalApplication);
+    if (!ok && context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('无法打开浏览器'),
+          behavior: SnackBarBehavior.floating,
+          duration: Duration(seconds: 1),
+        ),
+      );
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -18,19 +35,13 @@ class ProfileScreen extends StatelessWidget {
     final bottomPad = MediaQuery.of(context).padding.bottom;
     return Scaffold(
       backgroundColor: Colors.transparent,
-      appBar: AppBar(
-        title: const Text('我的'),
-        backgroundColor: Colors.transparent,
-        elevation: 0,
-        centerTitle: true,
-      ),
-      body: ListView(
-        padding: EdgeInsets.fromLTRB(16, 8, 16, bottomPad + 110),
-        children: [
-          _SectionCard(
-            child: Column(
+      body: SafeArea(
+        child: ListView(
+          padding: EdgeInsets.fromLTRB(16, 24, 16, bottomPad + 110),
+          children: [
+            // 图标 + 名称：去掉圆角矩形底。
+            Column(
               children: [
-                const SizedBox(height: 8),
                 Container(
                   width: 84,
                   height: 84,
@@ -63,53 +74,54 @@ class ProfileScreen extends StatelessWidget {
                   'Version 0.3.0',
                   style: TextStyle(fontSize: 13, color: muted),
                 ),
-                const SizedBox(height: 8),
-              ],
-            ),
-          ),
-          const SizedBox(height: 16),
-          _SectionCard(
-            child: Column(
-              children: [
-                _SettingRow(
-                  icon: Icons.text_fields_rounded,
-                  title: '显示格式',
-                  trailing: Text(
-                    _formatLabel(state.displayFormat),
-                    style: TextStyle(fontSize: 14, color: muted),
+                const SizedBox(height: 6),
+                GestureDetector(
+                  onTap: () => _openGithub(context),
+                  child: const Text(
+                    'Github主页',
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: DuckColors.saveBlue,
+                    ),
                   ),
-                  onTap: () => _showFormatDialog(context, state),
-                ),
-                _divider(dark),
-                _SettingRow(
-                  icon: Icons.dark_mode_outlined,
-                  title: '软件外观',
-                  trailing: Text(
-                    _themeLabel(state.themeMode),
-                    style: TextStyle(fontSize: 14, color: muted),
-                  ),
-                  onTap: () => _showThemeDialog(context, state),
                 ),
               ],
             ),
-          ),
-          const SizedBox(height: 16),
-          _SectionCard(
-            child: Column(
-              children: [
-                _SettingRow(
-                  icon: Icons.info_outline_rounded,
-                  title: '关于',
-                  trailing: Text(
-                    'Version 0.3.0',
-                    style: TextStyle(fontSize: 14, color: muted),
+            const SizedBox(height: 20),
+            _SectionCard(
+              child: Column(
+                children: [
+                  _SettingRow(
+                    icon: Icons.text_fields_rounded,
+                    title: '显示格式',
+                    trailing: Text(
+                      _formatLabel(state.displayFormat),
+                      style: TextStyle(fontSize: 14, color: muted),
+                    ),
+                    onTap: () => _showFormatDialog(context, state),
                   ),
-                  onTap: () => _showAbout(context),
-                ),
-              ],
+                  _divider(dark),
+                  _SwitchRow(
+                    icon: Icons.content_copy_rounded,
+                    title: '复制HEX去掉#',
+                    value: state.stripHashOnCopy,
+                    onChanged: state.setStripHashOnCopy,
+                  ),
+                  _divider(dark),
+                  _SettingRow(
+                    icon: Icons.dark_mode_outlined,
+                    title: '软件外观',
+                    trailing: Text(
+                      _themeLabel(state.themeMode),
+                      style: TextStyle(fontSize: 14, color: muted),
+                    ),
+                    onTap: () => _showThemeDialog(context, state),
+                  ),
+                ],
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -125,9 +137,7 @@ class ProfileScreen extends StatelessWidget {
   String _formatLabel(ColorFormat f) {
     switch (f) {
       case ColorFormat.hex:
-        return 'HEX（不含 #）';
-      case ColorFormat.hexWithHash:
-        return 'HEX（含 #）';
+        return 'HEX';
       case ColorFormat.rgb:
         return 'RGB';
       case ColorFormat.hsl:
@@ -169,15 +179,6 @@ class ProfileScreen extends StatelessWidget {
       selected: state.themeMode,
       label: _themeLabel,
       onSelect: state.setThemeMode,
-    );
-  }
-
-  void _showAbout(BuildContext context) {
-    showAboutDialog(
-      context: context,
-      applicationName: '取色鸭相机版',
-      applicationVersion: '0.3.0',
-      applicationLegalese: '用相机随时随地取色的小鸭子',
     );
   }
 }
@@ -297,6 +298,51 @@ class _SettingRow extends StatelessWidget {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+/// 开关行（无跳转箭头）。
+class _SwitchRow extends StatelessWidget {
+  const _SwitchRow({
+    required this.icon,
+    required this.title,
+    required this.value,
+    required this.onChanged,
+  });
+
+  final IconData icon;
+  final String title;
+  final bool value;
+  final ValueChanged<bool> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    final text = dark ? DuckColors.textDark : DuckColors.textLight;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Row(
+        children: [
+          Icon(icon, size: 22, color: text),
+          const SizedBox(width: 14),
+          Expanded(
+            child: Text(
+              title,
+              style: TextStyle(
+                fontSize: 16,
+                fontWeight: FontWeight.w600,
+                color: text,
+              ),
+            ),
+          ),
+          Switch(
+            value: value,
+            onChanged: onChanged,
+            activeThumbColor: DuckColors.saveBlue,
+          ),
+        ],
       ),
     );
   }

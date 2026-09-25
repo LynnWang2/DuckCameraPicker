@@ -1,18 +1,16 @@
 import 'package:flutter/material.dart';
 
-/// 色值格式，与桌面端取色鸭的格式开关保持一致。
+/// 色值格式。HEX 统一为含 # 显示；复制时可通过开关去掉 #。
 enum ColorFormat {
-  hex('HEX', '不含 #'),
-  hexWithHash('HEX', '含 #'),
-  rgb('RGB', ''),
-  hsl('HSL', ''),
-  cmyk('CMYK', '');
+  hex('HEX'),
+  rgb('RGB'),
+  hsl('HSL'),
+  cmyk('CMYK');
 
-  const ColorFormat(this.label, this.hint);
+  const ColorFormat(this.label);
   final String label;
-  final String hint;
 
-  String get displayLabel => this == ColorFormat.hexWithHash ? 'HEX#' : label;
+  String get displayLabel => label;
 }
 
 /// 一次取色结果。命名与色值算法直接移植自桌面端取色鸭（Rust 实现），
@@ -56,12 +54,10 @@ class PickedColor {
   String get hsl => toHsl(r, g, b);
   String get cmyk => toCmyk(r, g, b);
 
-  /// 取色后复制的文本，按用户设置的格式输出。
+  /// 按用户设置的格式输出显示文本（HEX 统一含 #）。
   String valueFor(ColorFormat format) {
     switch (format) {
       case ColorFormat.hex:
-        return hexNoHash; // 不含 #
-      case ColorFormat.hexWithHash:
         return hexWithHash; // 含 #
       case ColorFormat.rgb:
         return rgb;
@@ -70,6 +66,12 @@ class PickedColor {
       case ColorFormat.cmyk:
         return cmyk;
     }
+  }
+
+  /// 复制用的文本：只在 HEX + 去掉 # 开关打开时与显示不同。
+  String valueForCopy(ColorFormat format, {required bool stripHash}) {
+    if (format == ColorFormat.hex && stripHash) return hexNoHash;
+    return valueFor(format);
   }
 
   Map<String, dynamic> toJson() => {

@@ -40,12 +40,19 @@ void main() {
       expect(gray.cmyk, 'cmyk(0%, 0%, 0%, 50%)');
     });
 
-    test('valueFor 按设置输出对应格式', () {
-      expect(red.valueFor(ColorFormat.hex), 'FF0000');
-      expect(red.valueFor(ColorFormat.hexWithHash), '#FF0000');
+    test('valueFor 按设置输出对应格式（HEX 统一含 #）', () {
+      expect(red.valueFor(ColorFormat.hex), '#FF0000');
       expect(red.valueFor(ColorFormat.rgb), 'rgb(255, 0, 0)');
       expect(red.valueFor(ColorFormat.hsl), 'hsl(0, 100%, 50%)');
       expect(red.valueFor(ColorFormat.cmyk), 'cmyk(0%, 100%, 100%, 0%)');
+    });
+
+    test('valueForCopy：复制HEX去掉# 只影响复制', () {
+      expect(
+          red.valueForCopy(ColorFormat.hex, stripHash: false), '#FF0000');
+      expect(red.valueForCopy(ColorFormat.hex, stripHash: true), 'FF0000');
+      expect(red.valueForCopy(ColorFormat.rgb, stripHash: true),
+          'rgb(255, 0, 0)');
     });
   });
 

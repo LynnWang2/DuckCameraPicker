@@ -1,22 +1,35 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 import 'dart:ui';
 
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:image/image.dart' as img;
 import 'package:provider/provider.dart';
+import 'package:vector_math/vector_math_64.dart' show Matrix4, Vector3;
 
 import '../camera/frame_sampler.dart';
 import '../models/picked_color.dart';
 import '../state/app_state.dart';
 import '../theme/duck_theme.dart';
 
+/// JPEG 解码（跑在后台 isolate，避免阻塞 UI）：解码 + 按 EXIF 摆正，
+/// 使采样坐标与 Image.file 的显示方向一致。
+img.Image? _decodeJpg(Uint8List bytes) {
+  final decoded = img.decodeJpg(bytes);
+  if (decoded == null) return null;
+  return img.bakeOrientation(decoded);
+}
+
 /// 相机取色页（中间标签页）：实时预览 + 中央取色点。
 /// - 标签栏上方的相机按钮：按下定格画面，定格后变成 X 按钮，按下回到实时取色
+/// - 定格后：画面暂停，取色点可跟随单指拖动，取色结果实时变化；
+///   双指缩放定格图（数字变焦，矩阵手势驱动）
 /// - 相机按钮上方：高斯模糊圆角矩形颜色卡片（色块 + 中文名 + 色值 + 保存按钮）
-/// - 双指缩放预览，缩放时显示放大倍数
-/// 取色点固定为画面中心，避开预览旋转带来的坐标映射问题。
+/// - 实时预览双指缩放：硬件变焦，非阻塞调用 + 节流，避免卡顿
 class CameraPage extends StatefulWidget {
   const CameraPage({super.key, required this.active});
 
@@ -37,13 +50,26 @@ class _CameraPageState extends State<CameraPage> {
 
   // 定格画面
   XFile? _frozen;
+  double _frozenOpacity = 0.0;
 
-  // 双指缩放
+  // 定格图全分辨率解码（用于按图像坐标采样）
+  img.Image? _frozenDecoded;
+
+  // 定格后取色点位置（屏幕坐标；null = 画面中心）
+  final ValueNotifier<Offset?> _pickPoint = ValueNotifier<Offset?>(null);
+  DateTime? _lastFrozenSample;
+
+  // 定格图数字变焦矩阵（手势直接驱动，不重建整棵树）
+  final ValueNotifier<Matrix4> _frozenMatrix =
+      ValueNotifier<Matrix4>(Matrix4.identity());
+  Matrix4 _frozenBaseMatrix = Matrix4.identity();
+
+  // 实时预览缩放
   double _minZoom = 1.0;
   double _maxZoom = 1.0;
   double _zoom = 1.0;
   double _baseZoom = 1.0;
-  bool _zooming = false;
+  final ValueNotifier<double?> _zoomBadge = ValueNotifier<double?>(null);
   Timer? _zoomHideTimer;
 
   @override
@@ -78,7 +104,8 @@ class _CameraPageState extends State<CameraPage> {
       );
       final controller = CameraController(
         back,
-        ResolutionPreset.medium,
+        // 高分辨率：定格图更清晰，采样也更准。
+        ResolutionPreset.high,
         enableAudio: false,
       );
       await controller.initialize();
@@ -176,53 +203,190 @@ class _CameraPageState extends State<CameraPage> {
     }
   }
 
-  /// 定格画面。
+  /// 定格画面：先暂停预览（最后一帧留在下面做底），再拍照，
+  /// 拍到的高清图用淡入盖在上面过渡——中间没有黑帧，不闪屏。
   Future<void> _freeze() async {
     final controller = _controller;
     if (controller == null || _frozen != null) return;
     _stopStream();
     try {
+      await controller.pausePreview();
+    } catch (_) {}
+    try {
       final file = await controller.takePicture();
       if (!mounted) return;
-      setState(() => _frozen = file);
+      _frozenDecoded = null;
+      _frozenBaseMatrix = Matrix4.identity();
+      _frozenMatrix.value = Matrix4.identity();
+      _pickPoint.value = null;
+      _lastFrozenSample = null;
+      setState(() {
+        _frozen = file;
+        _frozenOpacity = 0.0;
+      });
+      // 下一帧再淡入，盖住预览纹理拆除的瞬间。
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _frozen == file) {
+          setState(() => _frozenOpacity = 1.0);
+        }
+      });
+      // 后台解码全分辨率帧，供取色点采样。
+      unawaited(_decodeFrozen(file));
     } catch (_) {
       // 定格失败则恢复实时流。
-      if (mounted) _startStream();
+      if (!mounted) return;
+      try {
+        await controller.resumePreview();
+      } catch (_) {}
+      _startStream();
+    }
+  }
+
+  Future<void> _decodeFrozen(XFile file) async {
+    try {
+      final bytes = await file.readAsBytes();
+      final decoded = await compute(_decodeJpg, bytes);
+      if (!mounted || _frozen?.path != file.path) return;
+      _frozenDecoded = decoded;
+      // 解码完成后按当前取色点位置采一次。
+      final size = MediaQuery.of(context).size;
+      _sampleFrozenAt(
+          _pickPoint.value ?? Offset(size.width / 2, size.height / 2));
+    } catch (_) {
+      // 解码失败就不支持定格采样，定格图照常显示。
     }
   }
 
   /// 回到实时取色。
-  void _unfreeze() {
+  Future<void> _unfreeze() async {
     final f = _frozen;
     _frozen = null;
+    _frozenDecoded = null;
+    _pickPoint.value = null;
+    _frozenMatrix.value = Matrix4.identity();
     if (f != null) {
       try {
         File(f.path).delete();
       } catch (_) {}
     }
-    setState(() {});
+    final controller = _controller;
+    if (controller != null) {
+      try {
+        await controller.resumePreview();
+      } catch (_) {}
+    }
+    if (!mounted) return;
+    setState(() => _frozenOpacity = 0.0);
     _startStream();
   }
 
+  // —— 实时预览双指缩放：硬件变焦，非阻塞 + 节流，UI 只更新倍数徽标 ——
   void _onScaleStart(ScaleStartDetails details) {
     _baseZoom = _zoom;
   }
 
-  Future<void> _onScaleUpdate(ScaleUpdateDetails details) async {
+  void _onScaleUpdate(ScaleUpdateDetails details) {
     final controller = _controller;
     if (controller == null || _frozen != null) return;
     final next = (_baseZoom * details.scale).clamp(_minZoom, _maxZoom);
-    if ((next - _zoom).abs() < 0.01) return;
+    if ((next - _zoom).abs() < 0.005) return;
     _zoom = next;
-    try {
-      await controller.setZoomLevel(_zoom);
-    } catch (_) {}
-    if (!mounted) return;
-    setState(() => _zooming = true);
+    // 不 await：平台调用排队是之前卡顿的主因。
+    unawaited(controller.setZoomLevel(_zoom).then((_) {}).catchError((_) {}));
+    _zoomBadge.value = _zoom;
     _zoomHideTimer?.cancel();
     _zoomHideTimer = Timer(const Duration(seconds: 1), () {
-      if (mounted) setState(() => _zooming = false);
+      _zoomBadge.value = null;
     });
+  }
+
+  // —— 定格后：单指拖动取色点 ——
+  void _movePickPoint(Offset localPosition) {
+    final size = MediaQuery.of(context).size;
+    final p = Offset(
+      localPosition.dx.clamp(0.0, size.width),
+      localPosition.dy.clamp(0.0, size.height),
+    );
+    _pickPoint.value = p;
+    // 采样节流：拖动时最高约 11Hz，避免频繁 setState。
+    final now = DateTime.now();
+    if (_lastFrozenSample == null ||
+        now.difference(_lastFrozenSample!) >
+            const Duration(milliseconds: 90)) {
+      _lastFrozenSample = now;
+      _sampleFrozenAt(p);
+    }
+  }
+
+  void _onFrozenPanUpdate(DragUpdateDetails details) {
+    _movePickPoint(details.localPosition);
+  }
+
+  void _onFrozenPanEnd(DragEndDetails details) {
+    // 抬手时按最终位置再采一次，保证准确。
+    final p = _pickPoint.value;
+    if (p != null) {
+      _lastFrozenSample = DateTime.now();
+      _sampleFrozenAt(p);
+    }
+  }
+
+  void _onFrozenTapDown(TapDownDetails details) {
+    _lastFrozenSample = DateTime.now();
+    _movePickPoint(details.localPosition);
+    final p = _pickPoint.value;
+    if (p != null) _sampleFrozenAt(p);
+  }
+
+  /// 在定格的全分辨率帧上，按取色点的屏幕坐标采样像素颜色。
+  void _sampleFrozenAt(Offset point) {
+    final decoded = _frozenDecoded;
+    if (decoded == null || !mounted) return;
+    final iw = decoded.width, ih = decoded.height;
+    if (iw == 0 || ih == 0) return;
+    final size = MediaQuery.of(context).size;
+    // 屏幕坐标 -> 去掉数字变焦矩阵 -> cover 映射到图像坐标。
+    final inv = Matrix4.inverted(_frozenMatrix.value);
+    final q = inv.transform3(Vector3(point.dx, point.dy, 0));
+    final s = math.max(size.width / iw, size.height / ih);
+    final ox = (size.width - iw * s) / 2;
+    final oy = (size.height - ih * s) / 2;
+    final ix = ((q.x - ox) / s).round().clamp(0, iw - 1);
+    final iy = ((q.y - oy) / s).round().clamp(0, ih - 1);
+    var r = 0, g = 0, b = 0, n = 0;
+    for (var y = iy - 2; y <= iy + 2; y++) {
+      if (y < 0 || y >= ih) continue;
+      for (var x = ix - 2; x <= ix + 2; x++) {
+        if (x < 0 || x >= iw) continue;
+        final px = decoded.getPixel(x, y);
+        r += px.r.toInt();
+        g += px.g.toInt();
+        b += px.b.toInt();
+        n++;
+      }
+    }
+    if (n == 0) return;
+    setState(() => _current = SampledPixel(r ~/ n, g ~/ n, b ~/ n));
+  }
+
+  // —— 定格图双指缩放：数字变焦，矩阵手势直接驱动 ——
+  void _onFrozenScaleStart(ScaleStartDetails details) {
+    _frozenBaseMatrix = _frozenMatrix.value.clone();
+  }
+
+  void _onFrozenScaleUpdate(ScaleUpdateDetails details) {
+    if ((details.scale - 1.0).abs() < 0.002) return;
+    final base = _frozenBaseMatrix;
+    final baseScale = base.getMaxScaleOnAxis();
+    final targetScale = (baseScale * details.scale).clamp(1.0, 5.0);
+    final s = targetScale / baseScale;
+    final f = details.localFocalPoint;
+    final m = Matrix4.identity()
+      ..translateByDouble(f.dx, f.dy, 0.0, 1.0)
+      ..scaleByDouble(s, s, 1.0, 1.0)
+      ..translateByDouble(-f.dx, -f.dy, 0.0, 1.0);
+    m.multiply(base);
+    _frozenMatrix.value = m;
   }
 
   /// 保存当前颜色到取色历史。
@@ -252,6 +416,9 @@ class _CameraPageState extends State<CameraPage> {
   void dispose() {
     _sampleTimer?.cancel();
     _zoomHideTimer?.cancel();
+    _pickPoint.dispose();
+    _frozenMatrix.dispose();
+    _zoomBadge.dispose();
     final f = _frozen;
     if (f != null) {
       try {
@@ -283,20 +450,9 @@ class _CameraPageState extends State<CameraPage> {
         extendBody: true,
         body: Stack(
           children: [
-            // 预览 / 定格画面（双指缩放预览）
+            // 预览 / 定格画面
             Positioned.fill(
-              child: frozen
-                  ? Image.file(File(_frozen!.path), fit: BoxFit.cover)
-                  : (controller != null && controller.value.isInitialized
-                      ? GestureDetector(
-                          onScaleStart: _onScaleStart,
-                          onScaleUpdate: _onScaleUpdate,
-                          child: _PreviewFill(controller: controller),
-                        )
-                      : const Center(
-                          child: CircularProgressIndicator(
-                              color: DuckColors.accent),
-                        )),
+              child: frozen ? _buildFrozen() : _buildLive(controller),
             ),
             if (_error != null)
               Positioned.fill(
@@ -325,18 +481,37 @@ class _CameraPageState extends State<CameraPage> {
                   ),
                 ),
               ),
-            // 中央取色点
-            if (!frozen) const Center(child: _PickDot()),
-            // 缩放倍数指示
-            if (_zooming)
-              Positioned(
-                top: 0,
-                left: 0,
-                right: 0,
-                child: SafeArea(
-                  child: Center(child: _ZoomBadge(zoom: _zoom)),
-                ),
+            // 取色点：实时模式固定中央；定格后可拖动
+            if (!frozen)
+              const Center(child: _PickDot())
+            else
+              ValueListenableBuilder<Offset?>(
+                valueListenable: _pickPoint,
+                builder: (context, p, _) {
+                  final size = MediaQuery.of(context).size;
+                  final c = p ?? Offset(size.width / 2, size.height / 2);
+                  return Positioned(
+                    left: c.dx - 9,
+                    top: c.dy - 9,
+                    child: const _PickDot(),
+                  );
+                },
               ),
+            // 缩放倍数指示（只重建徽标本身）
+            ValueListenableBuilder<double?>(
+              valueListenable: _zoomBadge,
+              builder: (context, z, _) {
+                if (z == null) return const SizedBox.shrink();
+                return Positioned(
+                  top: 0,
+                  left: 0,
+                  right: 0,
+                  child: SafeArea(
+                    child: Center(child: _ZoomBadge(zoom: z)),
+                  ),
+                );
+              },
+            ),
             // 闪光灯
             Positioned(
               top: 0,
@@ -377,6 +552,48 @@ class _CameraPageState extends State<CameraPage> {
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+
+  /// 实时预览（双指硬件缩放）。
+  Widget _buildLive(CameraController? controller) {
+    if (controller == null || !controller.value.isInitialized) {
+      return const Center(
+        child: CircularProgressIndicator(color: DuckColors.accent),
+      );
+    }
+    return GestureDetector(
+      onScaleStart: _onScaleStart,
+      onScaleUpdate: _onScaleUpdate,
+      child: _PreviewFill(controller: controller),
+    );
+  }
+
+  /// 定格画面：高清图淡入盖在已暂停的预览上；单指拖动取色点，双指数值变焦。
+  Widget _buildFrozen() {
+    return GestureDetector(
+      onTapDown: _onFrozenTapDown,
+      onPanUpdate: _onFrozenPanUpdate,
+      onPanEnd: _onFrozenPanEnd,
+      onScaleStart: _onFrozenScaleStart,
+      onScaleUpdate: _onFrozenScaleUpdate,
+      child: AnimatedOpacity(
+        opacity: _frozenOpacity,
+        duration: const Duration(milliseconds: 160),
+        child: ValueListenableBuilder<Matrix4>(
+          valueListenable: _frozenMatrix,
+          builder: (context, m, child) => Transform(
+            transform: m,
+            child: child,
+          ),
+          child: Image.file(
+            File(_frozen!.path),
+            fit: BoxFit.cover,
+            width: double.infinity,
+            height: double.infinity,
+          ),
         ),
       ),
     );
@@ -590,7 +807,7 @@ class _ZoomBadge extends StatelessWidget {
   }
 }
 
-/// 中央取色点：小圆圈。
+/// 取色点：小圆圈。
 class _PickDot extends StatelessWidget {
   const _PickDot();
 

@@ -10,9 +10,9 @@ class DuckColors {
   static const textLight = Color(0xFF111827);
   static const mutedLight = Color(0xFF8E8E93);
 
-  // —— 深色（灰黑）——
-  static const bgDark = Color(0xFF1C1C1E);
-  static const cardDark = Color(0xFF2C2C2E);
+  // —— 深色（更深的灰黑）——
+  static const bgDark = Color(0xFF101013);
+  static const cardDark = Color(0xFF1C1C1F);
   static const textDark = Color(0xFFF5F5F7);
   static const mutedDark = Color(0xFF9A9AA0);
 

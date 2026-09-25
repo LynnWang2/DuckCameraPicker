@@ -1,9 +1,9 @@
-import 'dart:ui';
-
 import 'package:flutter/material.dart';
 
-/// 底部标签栏：高级高斯模糊的圆角矩形底 + 简约黑色图标，
-/// 选中项带浅灰色圆角高亮。
+/// 底部标签栏：胶囊形悬浮底栏（参考图一）。
+/// - 白底胶囊、很圆的圆角、细描边 + 柔和投影
+/// - 选中项：浅灰圆角矩形底包裹图标 + 文字
+/// - 描边风图标，图标下有文字标签
 class GlassTabBar extends StatelessWidget {
   const GlassTabBar({
     super.key,
@@ -23,61 +23,57 @@ class GlassTabBar extends StatelessWidget {
     final dark = Theme.of(context).brightness == Brightness.dark;
     final bottomInset = MediaQuery.of(context).padding.bottom;
     return Padding(
-      padding: EdgeInsets.fromLTRB(20, 0, 20, bottomInset + 14),
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(32),
-        child: BackdropFilter(
-          filter: ImageFilter.blur(sigmaX: 28, sigmaY: 28),
-          child: Container(
-            height: 76,
-            decoration: BoxDecoration(
-              color: (dark ? Colors.black : Colors.white)
-                  .withValues(alpha: dark ? 0.55 : 0.68),
-              borderRadius: BorderRadius.circular(32),
-              border: Border.all(
-                color: Colors.white.withValues(alpha: dark ? 0.14 : 0.5),
-                width: 1,
-              ),
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withValues(alpha: 0.16),
-                  blurRadius: 24,
-                  offset: const Offset(0, 8),
-                ),
-              ],
-            ),
-            child: Row(
-              children: [
-                Expanded(
-                  child: _TabItem(
-                    icon: Icons.history_rounded,
-                    label: '取色历史',
-                    selected: currentIndex == 0,
-                    dark: dark,
-                    onTap: onHistoryTap,
-                  ),
-                ),
-                Expanded(
-                  child: _TabItem(
-                    icon: Icons.colorize_rounded,
-                    label: '取色',
-                    selected: currentIndex == 1,
-                    dark: dark,
-                    onTap: onCameraTap,
-                  ),
-                ),
-                Expanded(
-                  child: _TabItem(
-                    icon: Icons.person_outline_rounded,
-                    label: '我的',
-                    selected: currentIndex == 2,
-                    dark: dark,
-                    onTap: onProfileTap,
-                  ),
-                ),
-              ],
-            ),
+      padding: EdgeInsets.fromLTRB(18, 0, 18, bottomInset + 12),
+      child: Container(
+        height: 70,
+        decoration: BoxDecoration(
+          // 参考图：不透明的白底胶囊；深色下用深灰。
+          color: dark ? const Color(0xFF1B1B1E) : Colors.white,
+          borderRadius: BorderRadius.circular(35),
+          border: Border.all(
+            color: dark
+                ? Colors.white.withValues(alpha: 0.08)
+                : const Color(0xFFE4E4E9),
+            width: 1,
           ),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: dark ? 0.4 : 0.12),
+              blurRadius: 20,
+              offset: const Offset(0, 6),
+            ),
+          ],
+        ),
+        child: Row(
+          children: [
+            Expanded(
+              child: _TabItem(
+                icon: Icons.history_rounded,
+                label: '取色历史',
+                selected: currentIndex == 0,
+                dark: dark,
+                onTap: onHistoryTap,
+              ),
+            ),
+            Expanded(
+              child: _TabItem(
+                icon: Icons.photo_camera_outlined,
+                label: '取色',
+                selected: currentIndex == 1,
+                dark: dark,
+                onTap: onCameraTap,
+              ),
+            ),
+            Expanded(
+              child: _TabItem(
+                icon: Icons.person_outline_rounded,
+                label: '我的',
+                selected: currentIndex == 2,
+                dark: dark,
+                onTap: onProfileTap,
+              ),
+            ),
+          ],
         ),
       ),
     );
@@ -101,30 +97,30 @@ class _TabItem extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    // 简约黑（深色下为白）图标，选中时浅灰圆角底高亮。
-    final fg = dark ? Colors.white : Colors.black;
+    // 简约黑（深色下为白）描边图标，选中时浅灰圆角矩形底高亮。
+    final fg = dark ? Colors.white : const Color(0xFF111111);
     return GestureDetector(
       onTap: onTap,
       behavior: HitTestBehavior.opaque,
       child: Container(
-        margin: const EdgeInsets.symmetric(vertical: 8, horizontal: 6),
+        margin: const EdgeInsets.symmetric(vertical: 7, horizontal: 5),
         decoration: selected
             ? BoxDecoration(
                 color: dark
-                    ? const Color(0xFF3A3A3C).withValues(alpha: 0.85)
+                    ? const Color(0xFF2C2C30)
                     : const Color(0xFFE9E9EE),
-                borderRadius: BorderRadius.circular(22),
+                borderRadius: BorderRadius.circular(26),
               )
             : null,
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Icon(icon, size: 24, color: fg),
-            const SizedBox(height: 3),
+            Icon(icon, size: 26, color: fg),
+            const SizedBox(height: 4),
             Text(
               label,
               style: TextStyle(
-                fontSize: 11,
+                fontSize: 12,
                 fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
                 color: fg,
               ),
