@@ -1,13 +1,11 @@
 import 'dart:async';
-import 'dart:io';
-import 'dart:math' as math;
 import 'dart:ui';
+import 'dart:ui' as ui;
 
 import 'package:camera/camera.dart';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
-import 'package:image/image.dart' as img;
 import 'package:provider/provider.dart';
 import 'package:vector_math/vector_math_64.dart' show Matrix4, Vector3;
 
@@ -16,17 +14,13 @@ import '../models/picked_color.dart';
 import '../state/app_state.dart';
 import '../theme/duck_theme.dart';
 
-/// JPEG 解码（跑在后台 isolate，避免阻塞 UI）：解码 + 按 EXIF 摆正，
-/// 使采样坐标与 Image.file 的显示方向一致。
-img.Image? _decodeJpg(Uint8List bytes) {
-  final decoded = img.decodeJpg(bytes);
-  if (decoded == null) return null;
-  return img.bakeOrientation(decoded);
-}
-
 /// 相机取色页（中间标签页）：实时预览 + 中央取色点。
 /// - 标签栏上方的相机按钮：按下定格画面，定格后变成 X 按钮，按下回到实时取色
-/// - 定格后：画面暂停，取色点可跟随单指拖动，取色结果实时变化；
+/// - 定格原理：直接截取当前预览画面（RepaintBoundary.toImage），
+///   全程不调用 takePicture、不动预览用例——CameraX 的 takePicture 会解绑
+///   Preview 用例导致预览变黑，这是之前黑屏 bug 的根因；
+///   截取的帧与用户看到的画面逐像素一致，不存在"定格比实时模糊"的问题
+/// - 定格后：取色点可跟随单指拖动，取色结果实时变化；
 ///   双指缩放定格图（数字变焦，矩阵手势驱动）
 /// - 相机按钮上方：高斯模糊圆角矩形颜色卡片（色块 + 中文名 + 色值 + 保存按钮）
 /// - 实时预览双指缩放：硬件变焦，非阻塞调用 + 节流，避免卡顿
@@ -48,14 +42,18 @@ class _CameraPageState extends State<CameraPage> {
   String? _error;
   bool _flashOn = false;
 
-  // 定格画面：预览常驻底层，定格图在其上交叉淡入——任何时刻都有画面，绝不黑屏。
+  // 定格画面：直接截取预览当前帧（见 _freeze），全程不动相机预览，
+  // 从根上杜绝黑屏。定格图用 RawImage 直接显示 dart:ui Image，
+  // 取色直接读 RGBA 像素，无需二次解码。
   bool _frozen = false;
-  Uint8List? _frozenBytes;
+  ui.Image? _frozenImage;
+  ByteData? _frozenRgba;
+  int _frozenW = 0;
+  int _frozenH = 0;
+  double _frozenPr = 1.0;
   double _frozenOpacity = 0.0;
-  bool _capturing = false; // 拍照进行中，防止重复点击
-
-  // 定格图全分辨率解码（用于按图像坐标采样）
-  img.Image? _frozenDecoded;
+  bool _capturing = false; // 定格进行中，防止重复点击
+  final GlobalKey _previewKey = GlobalKey();
 
   // 定格后取色点位置（屏幕坐标；null = 画面中心）
   final ValueNotifier<Offset?> _pickPoint = ValueNotifier<Offset?>(null);
@@ -205,73 +203,76 @@ class _CameraPageState extends State<CameraPage> {
     }
   }
 
-  /// 定格画面：不暂停预览——预览纹理一直在底层渲染；
-  /// takePicture() 拿到 bytes 后再把定格图交叉淡入盖在上面。
-  /// 任何一步失败（拍照异常、bytes 为空）都留在实时预览，
-  /// 绝不出现"预览已拆、定格图未显示"的全黑中间态。
+  /// 定格画面：截取预览当前帧显示。
+  ///
+  /// 黑屏根因（已用插件源码验证）：CameraX 插件的 takePicture() 内部调用
+  /// bindToLifecycle([imageCapture])，按 CameraX 语义会解绑 Preview 用例，
+  /// 预览纹理直接变黑，且插件之后不再把 Preview 绑回来；
+  /// 若拍照抛异常/卡住，回退分支只重绑了 ImageAnalysis，预览永久黑屏。
+  /// 所以定格全程不再调用 takePicture：只停采样流（预览用例不动），
+  /// 用 RepaintBoundary.toImage() 截取当前预览帧——截到的就是用户看到的画面，
+  /// 任何一步失败都留在实时预览，不存在黑屏中间态。
   Future<void> _freeze() async {
     final controller = _controller;
     if (controller == null || !controller.value.isInitialized) return;
     if (_frozen || _capturing) return;
+    final boundary = _previewKey.currentContext?.findRenderObject()
+        as RenderRepaintBoundary?;
+    if (boundary == null) return;
     _capturing = true;
-    // 停掉采样流（拍照更稳），预览纹理继续渲染，做淡入的底。
+    // 只停采样流（clearAnalyzer），预览用例保持绑定、一直渲染。
     _stopStream();
     try {
-      final file = await controller.takePicture();
-      final bytes = await file.readAsBytes();
-      try {
-        await File(file.path).delete();
-      } catch (_) {}
-      if (!mounted || bytes.isEmpty) {
+      final pr =
+          MediaQuery.of(context).devicePixelRatio.clamp(1.0, 2.0).toDouble();
+      final uiImage = await boundary.toImage(pixelRatio: pr);
+      final byteData =
+          await uiImage.toByteData(format: ui.ImageByteFormat.rawRgba);
+      if (!mounted || byteData == null) {
+        uiImage.dispose();
         _startStream();
         return;
       }
-      _frozenDecoded = null;
+      _frozenImage?.dispose();
       _frozenBaseMatrix = Matrix4.identity();
       _frozenMatrix.value = Matrix4.identity();
       _pickPoint.value = null;
       _lastFrozenSample = null;
       setState(() {
         _frozen = true;
-        _frozenBytes = bytes;
+        _frozenImage = uiImage;
+        _frozenRgba = byteData;
+        _frozenW = uiImage.width;
+        _frozenH = uiImage.height;
+        _frozenPr = pr;
         _frozenOpacity = 0.0;
       });
-      // 下一帧开始淡入：下面是实时预览，上面是定格图，交叉过渡无黑帧。
+      // 下一帧开始淡入：下面是实时预览，上面是同一帧的截图，过渡无感知。
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted && _frozen) {
           setState(() => _frozenOpacity = 1.0);
         }
       });
-      // 全分辨率解码只用于取色采样，放后台 isolate，不阻塞显示。
-      unawaited(_decodeFrozenBytes(bytes));
+      // 定格瞬间按中心点采一次。
+      final size = MediaQuery.of(context).size;
+      _sampleFrozenAt(Offset(size.width / 2, size.height / 2));
     } catch (_) {
-      // 拍照失败：回到实时预览。
+      // 截图失败：回到实时预览。
       if (mounted) _startStream();
     } finally {
       _capturing = false;
     }
   }
 
-  Future<void> _decodeFrozenBytes(Uint8List bytes) async {
-    try {
-      final decoded = await compute(_decodeJpg, bytes);
-      if (!mounted || !_frozen) return;
-      _frozenDecoded = decoded;
-      // 解码完成后按当前取色点位置采一次。
-      final size = MediaQuery.of(context).size;
-      _sampleFrozenAt(
-          _pickPoint.value ?? Offset(size.width / 2, size.height / 2));
-    } catch (_) {
-      // 解码失败就不支持定格采样，定格图照常显示。
-    }
-  }
-
-  /// 回到实时取色：预览从未暂停，直接撤掉定格图、重启采样流。
+  /// 回到实时取色：预览从未动过，直接释放定格图、重启采样流。
   Future<void> _unfreeze() async {
     if (!_frozen) return;
     _frozen = false;
-    _frozenBytes = null;
-    _frozenDecoded = null;
+    _frozenImage?.dispose();
+    _frozenImage = null;
+    _frozenRgba = null;
+    _frozenW = 0;
+    _frozenH = 0;
     _frozenOpacity = 0.0;
     _pickPoint.value = null;
     _frozenMatrix.value = Matrix4.identity();
@@ -338,30 +339,30 @@ class _CameraPageState extends State<CameraPage> {
     if (p != null) _sampleFrozenAt(p);
   }
 
-  /// 在定格的全分辨率帧上，按取色点的屏幕坐标采样像素颜色。
+  /// 在定格帧的 RGBA 像素上，按取色点的屏幕坐标采样颜色。
+  /// 定格图就是预览截屏（pixelRatio = _frozenPr），屏幕坐标直接乘 pr 即可，
+  /// 无需 cover 映射、无需考虑旋转。
   void _sampleFrozenAt(Offset point) {
-    final decoded = _frozenDecoded;
-    if (decoded == null || !mounted) return;
-    final iw = decoded.width, ih = decoded.height;
-    if (iw == 0 || ih == 0) return;
-    final size = MediaQuery.of(context).size;
-    // 屏幕坐标 -> 去掉数字变焦矩阵 -> cover 映射到图像坐标。
+    final data = _frozenRgba;
+    if (data == null || !mounted) return;
+    final w = _frozenW, h = _frozenH;
+    if (w == 0 || h == 0) return;
+    final bytes = data.buffer.asUint8List();
+    // 先去掉数字变焦矩阵，再映射到截图像素。
     final inv = Matrix4.inverted(_frozenMatrix.value);
     final q = inv.transform3(Vector3(point.dx, point.dy, 0));
-    final s = math.max(size.width / iw, size.height / ih);
-    final ox = (size.width - iw * s) / 2;
-    final oy = (size.height - ih * s) / 2;
-    final ix = ((q.x - ox) / s).round().clamp(0, iw - 1);
-    final iy = ((q.y - oy) / s).round().clamp(0, ih - 1);
+    final cx = (q.x * _frozenPr).round().clamp(0, w - 1);
+    final cy = (q.y * _frozenPr).round().clamp(0, h - 1);
     var r = 0, g = 0, b = 0, n = 0;
-    for (var y = iy - 2; y <= iy + 2; y++) {
-      if (y < 0 || y >= ih) continue;
-      for (var x = ix - 2; x <= ix + 2; x++) {
-        if (x < 0 || x >= iw) continue;
-        final px = decoded.getPixel(x, y);
-        r += px.r.toInt();
-        g += px.g.toInt();
-        b += px.b.toInt();
+    for (var y = cy - 2; y <= cy + 2; y++) {
+      if (y < 0 || y >= h) continue;
+      for (var x = cx - 2; x <= cx + 2; x++) {
+        if (x < 0 || x >= w) continue;
+        final o = (y * w + x) * 4;
+        if (o + 2 >= bytes.length) continue;
+        r += bytes[o];
+        g += bytes[o + 1];
+        b += bytes[o + 2];
         n++;
       }
     }
@@ -419,7 +420,9 @@ class _CameraPageState extends State<CameraPage> {
     _pickPoint.dispose();
     _frozenMatrix.dispose();
     _zoomBadge.dispose();
-    _frozenBytes = null;
+    _frozenImage?.dispose();
+    _frozenImage = null;
+    _frozenRgba = null;
     final controller = _controller;
     _controller = null;
     if (controller != null) unawaited(_disposeController(controller));
@@ -445,11 +448,15 @@ class _CameraPageState extends State<CameraPage> {
         extendBody: true,
         body: Stack(
           children: [
-            // 预览常驻底层；定格图在其上交叉淡入——任何时刻都有画面，不黑屏。
+            // 预览常驻底层（包在 RepaintBoundary 里供定格截图）；定格图是同一帧
+            // 的截图，在其上淡入——预览用例全程不被动过，绝不黑屏。
             Positioned.fill(
-              child: _buildLive(controller),
+              child: RepaintBoundary(
+                key: _previewKey,
+                child: _buildLive(controller),
+              ),
             ),
-            if (frozen && _frozenBytes != null)
+            if (frozen && _frozenImage != null)
               Positioned.fill(
                 child: _buildFrozen(),
               ),
@@ -570,11 +577,12 @@ class _CameraPageState extends State<CameraPage> {
     );
   }
 
-  /// 定格画面：Image.memory 直接渲染原始 bytes（Flutter 异步解码，
-  /// 不等 image 包），淡入盖在实时预览上；单指拖动取色点，双指数值变焦。
+  /// 定格画面：RawImage 直接显示截取的 dart:ui Image（无需编解码），
+  /// 淡入盖在实时预览上；单指拖动取色点，双指数值变焦。
+  /// 截到的就是当前预览帧，淡入过渡用户无感知，也没有解码等待。
   Widget _buildFrozen() {
-    final bytes = _frozenBytes;
-    if (bytes == null) return const SizedBox.shrink();
+    final image = _frozenImage;
+    if (image == null) return const SizedBox.shrink();
     return GestureDetector(
       onTapDown: _onFrozenTapDown,
       onPanUpdate: _onFrozenPanUpdate,
@@ -590,12 +598,11 @@ class _CameraPageState extends State<CameraPage> {
             transform: m,
             child: child,
           ),
-          child: Image.memory(
-            bytes,
-            fit: BoxFit.cover,
-            width: double.infinity,
-            height: double.infinity,
-            gaplessPlayback: true,
+          child: SizedBox.expand(
+            child: RawImage(
+              image: image,
+              fit: BoxFit.cover,
+            ),
           ),
         ),
       ),

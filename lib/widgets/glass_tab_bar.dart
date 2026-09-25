@@ -25,7 +25,8 @@ class GlassTabBar extends StatelessWidget {
     final dark = Theme.of(context).brightness == Brightness.dark;
     final bottomInset = MediaQuery.of(context).padding.bottom;
     return Padding(
-      padding: EdgeInsets.fromLTRB(18, 0, 18, bottomInset + 12),
+      // 外层大胶囊：左右收窄为悬浮胶囊（参考图一比例），上下高度不变。
+      padding: EdgeInsets.fromLTRB(56, 0, 56, bottomInset + 12),
       child: ClipRRect(
         borderRadius: BorderRadius.circular(35),
         child: BackdropFilter(
@@ -103,21 +104,20 @@ class _TabItem extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    // 简约黑（深色下为白）描边图标；
-    // 选中时显示紧包裹内容的小药丸（参考图一），不撑满整个标签区。
+    // 选中时显示紧贴内容的小圆角矩形（参考图一），不拉长成大胶囊。
     final fg = dark ? Colors.white : const Color(0xFF111111);
     return GestureDetector(
       onTap: onTap,
       behavior: HitTestBehavior.opaque,
       child: Center(
         child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 7),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
           decoration: selected
               ? BoxDecoration(
                   color: dark
                       ? const Color(0xFF2C2C30)
                       : const Color(0xFFE9E9EE),
-                  borderRadius: BorderRadius.circular(24),
+                  borderRadius: BorderRadius.circular(18),
                 )
               : null,
           child: Column(
