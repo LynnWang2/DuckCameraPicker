@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 
-/// 取色鸭设计 token（2026-09-25 新版）：
+/// 识色鸭设计 token（2026-09-25 新版）：
 /// 浅色为非常浅的灰底 + 白色卡片（无描边，底部浅灰小投影）；
 /// 深色为灰黑底 + 深灰卡片。
 class DuckColors {

@@ -34,7 +34,7 @@ class DuckApp extends StatelessWidget {
   Widget build(BuildContext context) {
     final themeMode = context.select<AppState, ThemeMode>((s) => s.themeMode);
     return MaterialApp(
-      title: '取色鸭·相机版',
+      title: '识色鸭',
       debugShowCheckedModeBanner: false,
       theme: DuckTheme.light(),
       darkTheme: DuckTheme.dark(),

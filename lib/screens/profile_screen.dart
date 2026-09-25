@@ -62,7 +62,7 @@ class ProfileScreen extends StatelessWidget {
                 ),
                 const SizedBox(height: 12),
                 Text(
-                  '取色鸭相机版',
+                  '识色鸭',
                   style: TextStyle(
                     fontSize: 20,
                     fontWeight: FontWeight.w800,

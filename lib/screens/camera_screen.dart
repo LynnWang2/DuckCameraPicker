@@ -48,9 +48,11 @@ class _CameraPageState extends State<CameraPage> {
   String? _error;
   bool _flashOn = false;
 
-  // 定格画面
-  XFile? _frozen;
+  // 定格画面：预览常驻底层，定格图在其上交叉淡入——任何时刻都有画面，绝不黑屏。
+  bool _frozen = false;
+  Uint8List? _frozenBytes;
   double _frozenOpacity = 0.0;
+  bool _capturing = false; // 拍照进行中，防止重复点击
 
   // 定格图全分辨率解码（用于按图像坐标采样）
   img.Image? _frozenDecoded;
@@ -133,7 +135,7 @@ class _CameraPageState extends State<CameraPage> {
   void _startStream() {
     final controller = _controller;
     if (controller == null || !controller.value.isInitialized) return;
-    if (_frozen != null) return;
+    if (_frozen) return;
     try {
       controller.startImageStream((image) {
         _latestFrame = image;
@@ -203,50 +205,57 @@ class _CameraPageState extends State<CameraPage> {
     }
   }
 
-  /// 定格画面：先暂停预览（最后一帧留在下面做底），再拍照，
-  /// 拍到的高清图用淡入盖在上面过渡——中间没有黑帧，不闪屏。
+  /// 定格画面：不暂停预览——预览纹理一直在底层渲染；
+  /// takePicture() 拿到 bytes 后再把定格图交叉淡入盖在上面。
+  /// 任何一步失败（拍照异常、bytes 为空）都留在实时预览，
+  /// 绝不出现"预览已拆、定格图未显示"的全黑中间态。
   Future<void> _freeze() async {
     final controller = _controller;
-    if (controller == null || _frozen != null) return;
+    if (controller == null || !controller.value.isInitialized) return;
+    if (_frozen || _capturing) return;
+    _capturing = true;
+    // 停掉采样流（拍照更稳），预览纹理继续渲染，做淡入的底。
     _stopStream();
     try {
-      await controller.pausePreview();
-    } catch (_) {}
-    try {
       final file = await controller.takePicture();
-      if (!mounted) return;
+      final bytes = await file.readAsBytes();
+      try {
+        await File(file.path).delete();
+      } catch (_) {}
+      if (!mounted || bytes.isEmpty) {
+        _startStream();
+        return;
+      }
       _frozenDecoded = null;
       _frozenBaseMatrix = Matrix4.identity();
       _frozenMatrix.value = Matrix4.identity();
       _pickPoint.value = null;
       _lastFrozenSample = null;
       setState(() {
-        _frozen = file;
+        _frozen = true;
+        _frozenBytes = bytes;
         _frozenOpacity = 0.0;
       });
-      // 下一帧再淡入，盖住预览纹理拆除的瞬间。
+      // 下一帧开始淡入：下面是实时预览，上面是定格图，交叉过渡无黑帧。
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted && _frozen == file) {
+        if (mounted && _frozen) {
           setState(() => _frozenOpacity = 1.0);
         }
       });
-      // 后台解码全分辨率帧，供取色点采样。
-      unawaited(_decodeFrozen(file));
+      // 全分辨率解码只用于取色采样，放后台 isolate，不阻塞显示。
+      unawaited(_decodeFrozenBytes(bytes));
     } catch (_) {
-      // 定格失败则恢复实时流。
-      if (!mounted) return;
-      try {
-        await controller.resumePreview();
-      } catch (_) {}
-      _startStream();
+      // 拍照失败：回到实时预览。
+      if (mounted) _startStream();
+    } finally {
+      _capturing = false;
     }
   }
 
-  Future<void> _decodeFrozen(XFile file) async {
+  Future<void> _decodeFrozenBytes(Uint8List bytes) async {
     try {
-      final bytes = await file.readAsBytes();
       final decoded = await compute(_decodeJpg, bytes);
-      if (!mounted || _frozen?.path != file.path) return;
+      if (!mounted || !_frozen) return;
       _frozenDecoded = decoded;
       // 解码完成后按当前取色点位置采一次。
       final size = MediaQuery.of(context).size;
@@ -257,26 +266,17 @@ class _CameraPageState extends State<CameraPage> {
     }
   }
 
-  /// 回到实时取色。
+  /// 回到实时取色：预览从未暂停，直接撤掉定格图、重启采样流。
   Future<void> _unfreeze() async {
-    final f = _frozen;
-    _frozen = null;
+    if (!_frozen) return;
+    _frozen = false;
+    _frozenBytes = null;
     _frozenDecoded = null;
+    _frozenOpacity = 0.0;
     _pickPoint.value = null;
     _frozenMatrix.value = Matrix4.identity();
-    if (f != null) {
-      try {
-        File(f.path).delete();
-      } catch (_) {}
-    }
-    final controller = _controller;
-    if (controller != null) {
-      try {
-        await controller.resumePreview();
-      } catch (_) {}
-    }
     if (!mounted) return;
-    setState(() => _frozenOpacity = 0.0);
+    setState(() {});
     _startStream();
   }
 
@@ -287,7 +287,7 @@ class _CameraPageState extends State<CameraPage> {
 
   void _onScaleUpdate(ScaleUpdateDetails details) {
     final controller = _controller;
-    if (controller == null || _frozen != null) return;
+    if (controller == null || _frozen) return;
     final next = (_baseZoom * details.scale).clamp(_minZoom, _maxZoom);
     if ((next - _zoom).abs() < 0.005) return;
     _zoom = next;
@@ -419,12 +419,7 @@ class _CameraPageState extends State<CameraPage> {
     _pickPoint.dispose();
     _frozenMatrix.dispose();
     _zoomBadge.dispose();
-    final f = _frozen;
-    if (f != null) {
-      try {
-        File(f.path).delete();
-      } catch (_) {}
-    }
+    _frozenBytes = null;
     final controller = _controller;
     _controller = null;
     if (controller != null) unawaited(_disposeController(controller));
@@ -437,7 +432,7 @@ class _CameraPageState extends State<CameraPage> {
     final pixel = _current;
     final picked =
         pixel == null ? null : PickedColor.now(pixel.r, pixel.g, pixel.b);
-    final frozen = _frozen != null;
+    final frozen = _frozen;
     final bottomPad = MediaQuery.of(context).padding.bottom;
     // 相机页用浅色系统栏图标（白色），与预览形成对比。
     return AnnotatedRegion<SystemUiOverlayStyle>(
@@ -450,10 +445,14 @@ class _CameraPageState extends State<CameraPage> {
         extendBody: true,
         body: Stack(
           children: [
-            // 预览 / 定格画面
+            // 预览常驻底层；定格图在其上交叉淡入——任何时刻都有画面，不黑屏。
             Positioned.fill(
-              child: frozen ? _buildFrozen() : _buildLive(controller),
+              child: _buildLive(controller),
             ),
+            if (frozen && _frozenBytes != null)
+              Positioned.fill(
+                child: _buildFrozen(),
+              ),
             if (_error != null)
               Positioned.fill(
                 child: Container(
@@ -571,8 +570,11 @@ class _CameraPageState extends State<CameraPage> {
     );
   }
 
-  /// 定格画面：高清图淡入盖在已暂停的预览上；单指拖动取色点，双指数值变焦。
+  /// 定格画面：Image.memory 直接渲染原始 bytes（Flutter 异步解码，
+  /// 不等 image 包），淡入盖在实时预览上；单指拖动取色点，双指数值变焦。
   Widget _buildFrozen() {
+    final bytes = _frozenBytes;
+    if (bytes == null) return const SizedBox.shrink();
     return GestureDetector(
       onTapDown: _onFrozenTapDown,
       onPanUpdate: _onFrozenPanUpdate,
@@ -588,11 +590,12 @@ class _CameraPageState extends State<CameraPage> {
             transform: m,
             child: child,
           ),
-          child: Image.file(
-            File(_frozen!.path),
+          child: Image.memory(
+            bytes,
             fit: BoxFit.cover,
             width: double.infinity,
             height: double.infinity,
+            gaplessPlayback: true,
           ),
         ),
       ),
@@ -622,6 +625,7 @@ class _PreviewFill extends StatelessWidget {
 }
 
 /// 高斯模糊圆角矩形颜色卡片：左边色块 + 中文名 + 色值，右边保存按钮。
+/// iOS 18 风格磨砂：高 sigma 模糊 + 半透明底，透出后面画面。
 class _ColorCard extends StatelessWidget {
   const _ColorCard({required this.picked, required this.onSave});
 
@@ -636,28 +640,28 @@ class _ColorCard extends StatelessWidget {
     return ClipRRect(
       borderRadius: BorderRadius.circular(24),
       child: BackdropFilter(
-        filter: ImageFilter.blur(sigmaX: 20, sigmaY: 20),
+        filter: ImageFilter.blur(sigmaX: 28, sigmaY: 28),
         child: Container(
-          padding: const EdgeInsets.all(16),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
           decoration: BoxDecoration(
-            color: (dark ? Colors.black : Colors.white)
-                .withValues(alpha: dark ? 0.55 : 0.72),
+            color: (dark ? const Color(0xFF1C1C1E) : Colors.white)
+                .withValues(alpha: dark ? 0.52 : 0.58),
             borderRadius: BorderRadius.circular(24),
             border: Border.all(
-              color: Colors.white.withValues(alpha: dark ? 0.14 : 0.5),
+              color: Colors.white.withValues(alpha: dark ? 0.14 : 0.55),
             ),
           ),
           child: Row(
             children: [
               Container(
-                width: 62,
-                height: 62,
+                width: 52,
+                height: 52,
                 decoration: BoxDecoration(
                   color: p?.color ?? Colors.white24,
-                  borderRadius: BorderRadius.circular(18),
+                  borderRadius: BorderRadius.circular(15),
                 ),
               ),
-              const SizedBox(width: 14),
+              const SizedBox(width: 12),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -668,16 +672,16 @@ class _ColorCard extends StatelessWidget {
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(
-                        fontSize: 20,
+                        fontSize: 19,
                         fontWeight: FontWeight.w700,
                         color: dark ? Colors.white : const Color(0xFF111827),
                       ),
                     ),
-                    const SizedBox(height: 4),
+                    const SizedBox(height: 2),
                     Text(
                       p == null ? '--' : p.valueFor(state.displayFormat),
                       style: TextStyle(
-                        fontSize: 15,
+                        fontSize: 14,
                         color: dark
                             ? Colors.white70
                             : const Color(0xFF6B7280),

@@ -1,4 +1,4 @@
-# 取色鸭 · 相机版（Duck Camera Picker）
+# 识色鸭（Duck Camera Picker）
 
 以取色鸭桌面端 UI 为原型（黄鸭图标、大黄渐变按钮、暖色深浅主题、中文颜色命名），
 用 Flutter 重写的**相机实时取色**应用：把手机对准任何物体，中央准星实时识别颜色，
@@ -29,7 +29,7 @@ flutter run
 
 ## 平台配置（已完成）
 
-- iOS：`ios/Runner/Info.plist` 已添加 `NSCameraUsageDescription`（取色鸭需要使用相机进行实时取色）
+- iOS：`ios/Runner/Info.plist` 已添加 `NSCameraUsageDescription`（识色鸭需要使用相机进行实时取色）
 - Android：`android/app/src/main/AndroidManifest.xml` 已添加 `CAMERA` 权限 + `android.hardware.camera` feature
 
 相机权限由 `camera` 插件在运行时申请，拒绝后页面会显示重试入口。
