@@ -60,7 +60,7 @@ class ProfileScreen extends StatelessWidget {
                 ),
                 const SizedBox(height: 4),
                 Text(
-                  'Version 0.2.0',
+                  'Version 0.3.0',
                   style: TextStyle(fontSize: 13, color: muted),
                 ),
                 const SizedBox(height: 8),
@@ -101,7 +101,7 @@ class ProfileScreen extends StatelessWidget {
                   icon: Icons.info_outline_rounded,
                   title: '关于',
                   trailing: Text(
-                    'Version 0.2.0',
+                    'Version 0.3.0',
                     style: TextStyle(fontSize: 14, color: muted),
                   ),
                   onTap: () => _showAbout(context),
@@ -176,7 +176,7 @@ class ProfileScreen extends StatelessWidget {
     showAboutDialog(
       context: context,
       applicationName: '取色鸭相机版',
-      applicationVersion: '0.2.0',
+      applicationVersion: '0.3.0',
       applicationLegalese: '用相机随时随地取色的小鸭子',
     );
   }
