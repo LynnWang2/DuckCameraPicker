@@ -4,7 +4,7 @@
     <uses-feature android:name="android.hardware.camera" android:required="true" />
     <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
     <application
-        android:label="duck_camera_picker"
+        android:label="取色鸭相机版"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity

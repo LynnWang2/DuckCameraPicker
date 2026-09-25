@@ -9,9 +9,9 @@ import '../camera/frame_sampler.dart';
 import '../models/picked_color.dart';
 import '../state/app_state.dart';
 import '../theme/duck_theme.dart';
-import '../widgets/loupe.dart';
 
-/// 相机取色页：全屏预览，把中央准星对准颜色即可实时取色。
+/// 相机取色页：全屏预览，顶部圆角卡片实时显示颜色
+/// （左边色块，右边上面中文颜色名、下面色值），中央小圆圈为取色点。
 /// 取色点固定为画面中心，避开预览旋转带来的坐标映射问题。
 class CameraScreen extends StatefulWidget {
   const CameraScreen({super.key});
@@ -25,7 +25,6 @@ class _CameraScreenState extends State<CameraScreen> {
   CameraImage? _latestFrame;
   Timer? _sampleTimer;
   SampledPixel? _current;
-  List<List<SampledPixel>>? _loupeGrid;
   String? _error;
   bool _flashOn = false;
 
@@ -88,10 +87,7 @@ class _CameraScreenState extends State<CameraScreen> {
             6) {
       return;
     }
-    setState(() {
-      _current = pixel;
-      _loupeGrid = FrameSampler.sampleCenterGrid(frame);
-    });
+    setState(() => _current = pixel);
   }
 
   Future<void> _toggleFlash() async {
@@ -135,78 +131,106 @@ class _CameraScreenState extends State<CameraScreen> {
   @override
   Widget build(BuildContext context) {
     final controller = _controller;
-    return Scaffold(
-      backgroundColor: Colors.black,
-      body: Stack(
-        children: [
-          if (controller != null && controller.value.isInitialized)
-            Positioned.fill(child: _PreviewFill(controller: controller))
-          else
-            const Positioned.fill(
-              child: Center(
-                child: CircularProgressIndicator(color: DuckColors.accent),
+    final pixel = _current;
+    final picked =
+        pixel == null ? null : PickedColor.now(pixel.r, pixel.g, pixel.b);
+    // 相机页用浅色系统栏图标（白色），与黑色预览形成对比。
+    return AnnotatedRegion<SystemUiOverlayStyle>(
+      value: SystemUiOverlayStyle.light.copyWith(
+        statusBarColor: Colors.transparent,
+        systemNavigationBarColor: Colors.transparent,
+      ),
+      child: Scaffold(
+        backgroundColor: Colors.black,
+        extendBody: true,
+        body: Stack(
+          children: [
+            if (controller != null && controller.value.isInitialized)
+              Positioned.fill(child: _PreviewFill(controller: controller))
+            else
+              const Positioned.fill(
+                child: Center(
+                  child: CircularProgressIndicator(color: DuckColors.accent),
+                ),
+              ),
+            if (_error != null)
+              Positioned.fill(
+                child: Container(
+                  color: Colors.black87,
+                  child: Center(
+                    child: Padding(
+                      padding: const EdgeInsets.all(32),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            _error!,
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                                color: Colors.white, fontSize: 15),
+                          ),
+                          const SizedBox(height: 16),
+                          ElevatedButton(
+                            onPressed: _setupCamera,
+                            child: const Text('重试'),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            // 顶部：关闭 / 取色卡片 / 闪光灯
+            Positioned(
+              top: 0,
+              left: 0,
+              right: 0,
+              child: SafeArea(
+                bottom: false,
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+                  child: Row(
+                    children: [
+                      _RoundIconButton(
+                        icon: Icons.close_rounded,
+                        onTap: () => Navigator.of(context).pop(),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(child: _ColorCard(picked: picked)),
+                      const SizedBox(width: 10),
+                      _RoundIconButton(
+                        icon: _flashOn
+                            ? Icons.flash_on_rounded
+                            : Icons.flash_off_rounded,
+                        onTap: _toggleFlash,
+                      ),
+                    ],
+                  ),
+                ),
               ),
             ),
-          if (_error != null)
-            Positioned.fill(
-              child: Container(
-                color: Colors.black87,
-                child: Center(
-                  child: Padding(
-                    padding: const EdgeInsets.all(32),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Text(
-                          _error!,
-                          textAlign: TextAlign.center,
-                          style: const TextStyle(
-                              color: Colors.white, fontSize: 15),
-                        ),
-                        const SizedBox(height: 16),
-                        ElevatedButton(
-                          onPressed: _setupCamera,
-                          child: const Text('重试'),
-                        ),
-                      ],
+            // 中央取色点
+            const Center(child: _PickDot()),
+            // 底部确认按钮
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: 0,
+              child: SafeArea(
+                top: false,
+                child: Padding(
+                  padding: const EdgeInsets.only(bottom: 26),
+                  child: Center(
+                    child: _ConfirmButton(
+                      picked: picked,
+                      onConfirm: picked == null ? null : _confirm,
                     ),
                   ),
                 ),
               ),
             ),
-          // 中央准星
-          const Center(child: _Reticle()),
-          // 顶部栏
-          SafeArea(
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-              child: Row(
-                children: [
-                  _RoundIconButton(
-                    icon: Icons.close,
-                    onTap: () => Navigator.of(context).pop(),
-                  ),
-                  const Spacer(),
-                  _RoundIconButton(
-                    icon: _flashOn ? Icons.flash_on : Icons.flash_off,
-                    onTap: _toggleFlash,
-                  ),
-                ],
-              ),
-            ),
-          ),
-          // 底部取色面板
-          Positioned(
-            left: 0,
-            right: 0,
-            bottom: 0,
-            child: _BottomPanel(
-              current: _current,
-              loupeGrid: _loupeGrid,
-              onConfirm: _current == null ? null : _confirm,
-            ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -233,50 +257,94 @@ class _PreviewFill extends StatelessWidget {
   }
 }
 
-class _Reticle extends StatelessWidget {
-  const _Reticle();
+/// 顶部圆角矩形取色卡片：左边圆形色块，右边上面中文颜色名、下面色值。
+class _ColorCard extends StatelessWidget {
+  const _ColorCard({required this.picked});
+
+  final PickedColor? picked;
 
   @override
   Widget build(BuildContext context) {
-    return SizedBox(
-      width: 120,
-      height: 120,
-      child: CustomPaint(painter: _ReticlePainter()),
+    final p = picked;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(26),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.25),
+            blurRadius: 24,
+            offset: const Offset(0, 8),
+          ),
+        ],
+      ),
+      child: Row(
+        children: [
+          Container(
+            width: 52,
+            height: 52,
+            decoration: BoxDecoration(
+              color: p?.color ?? const Color(0xFFE5E7EB),
+              shape: BoxShape.circle,
+            ),
+          ),
+          const SizedBox(width: 14),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  p?.name ?? '取色中…',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.w700,
+                    color: Color(0xFF111827),
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  p?.hexWithHash ?? '--',
+                  style: const TextStyle(
+                    fontSize: 15,
+                    color: Color(0xFF9CA3AF),
+                    fontFamily: 'monospace',
+                    fontFamilyFallback: ['Menlo', 'Consolas'],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
 
-class _ReticlePainter extends CustomPainter {
-  @override
-  void paint(Canvas canvas, Size size) {
-    final c = Offset(size.width / 2, size.height / 2);
-    final ring = Paint()
-      ..color = Colors.white
-      ..strokeWidth = 2.5
-      ..style = PaintingStyle.stroke;
-    final ringShadow = Paint()
-      ..color = Colors.black45
-      ..strokeWidth = 5
-      ..style = PaintingStyle.stroke;
-    canvas.drawCircle(c, 34, ringShadow);
-    canvas.drawCircle(c, 34, ring);
-    final tick = Paint()
-      ..color = Colors.white
-      ..strokeWidth = 2.5
-      ..strokeCap = StrokeCap.round;
-    const gap = 40.0, len = 10.0;
-    canvas.drawLine(
-        Offset(c.dx - gap - len, c.dy), Offset(c.dx - gap, c.dy), tick);
-    canvas.drawLine(
-        Offset(c.dx + gap, c.dy), Offset(c.dx + gap + len, c.dy), tick);
-    canvas.drawLine(
-        Offset(c.dx, c.dy - gap - len), Offset(c.dx, c.dy - gap), tick);
-    canvas.drawLine(
-        Offset(c.dx, c.dy + gap), Offset(c.dx, c.dy + gap + len), tick);
-  }
+/// 中央取色点：小圆圈。
+class _PickDot extends StatelessWidget {
+  const _PickDot();
 
   @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+  Widget build(BuildContext context) {
+    return Container(
+      width: 18,
+      height: 18,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        border: Border.all(color: Colors.white, width: 2.5),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.45),
+            blurRadius: 6,
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 class _RoundIconButton extends StatelessWidget {
@@ -302,163 +370,46 @@ class _RoundIconButton extends StatelessWidget {
   }
 }
 
-class _BottomPanel extends StatelessWidget {
-  const _BottomPanel({
-    required this.current,
-    required this.loupeGrid,
-    required this.onConfirm,
-  });
+/// 底部悬浮确认按钮：确认取色并复制。
+class _ConfirmButton extends StatelessWidget {
+  const _ConfirmButton({required this.picked, required this.onConfirm});
 
-  final SampledPixel? current;
-  final List<List<SampledPixel>>? loupeGrid;
+  final PickedColor? picked;
   final VoidCallback? onConfirm;
 
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppState>();
-    final dark = Theme.of(context).brightness == Brightness.dark;
-    final pixel = current;
-    final picked = pixel == null
-        ? null
-        : PickedColor(
-            id: 'preview',
-            r: pixel.r,
-            g: pixel.g,
-            b: pixel.b,
-            name: colorName(pixel.r, pixel.g, pixel.b),
-            createdAt: DateTime.now(),
-          );
-
-    final formats = state.formats.isEmpty ? {ColorFormat.hex} : state.formats;
-
-    return Container(
-      decoration: BoxDecoration(
-        color: dark ? DuckColors.cardDark : Colors.white,
-        borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
-        boxShadow: const [
-          BoxShadow(
-              color: Colors.black26, blurRadius: 24, offset: Offset(0, -6))
-        ],
-      ),
-      child: SafeArea(
-        top: false,
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(20, 16, 20, 16),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Row(
-                children: [
-                  if (loupeGrid != null)
-                    LoupeView(grid: loupeGrid!, size: 104)
-                  else
-                    Container(
-                      width: 104,
-                      height: 104,
-                      decoration: const BoxDecoration(
-                        color: Colors.black12,
-                        shape: BoxShape.circle,
-                      ),
-                    ),
-                  const SizedBox(width: 16),
-                  Expanded(
-                    child: picked == null
-                        ? Text(
-                            '把准星对准要取的颜色',
-                            style: TextStyle(
-                              fontSize: 15,
-                              color: dark
-                                  ? DuckColors.mutedDark
-                                  : DuckColors.mutedLight,
-                            ),
-                          )
-                        : Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Row(
-                                children: [
-                                  Container(
-                                    width: 34,
-                                    height: 34,
-                                    decoration: BoxDecoration(
-                                      color: picked.color,
-                                      borderRadius: BorderRadius.circular(10),
-                                      border: Border.all(
-                                        color: dark
-                                            ? DuckColors.lineDark
-                                            : DuckColors.lineLight,
-                                      ),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 10),
-                                  Text(
-                                    picked.name,
-                                    style: TextStyle(
-                                      fontSize: 20,
-                                      fontWeight: FontWeight.w700,
-                                      color: dark
-                                          ? DuckColors.textDark
-                                          : DuckColors.textLight,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                              const SizedBox(height: 8),
-                              for (final f in ColorFormat.values)
-                                if (formats.contains(f))
-                                  Padding(
-                                    padding: const EdgeInsets.only(bottom: 2),
-                                    child: Row(
-                                      children: [
-                                        SizedBox(
-                                          width: 52,
-                                          child: Text(
-                                            f.displayLabel,
-                                            style: TextStyle(
-                                              fontSize: 12,
-                                              color: dark
-                                                  ? DuckColors.mutedDark
-                                                  : DuckColors.mutedLight,
-                                            ),
-                                          ),
-                                        ),
-                                        Expanded(
-                                          child: Text(
-                                            picked.valueFor(f),
-                                            style: TextStyle(
-                                              fontSize: 14,
-                                              fontFamily: 'monospace',
-                                              fontFamilyFallback: const [
-                                                'Menlo',
-                                                'Consolas'
-                                              ],
-                                              color: dark
-                                                  ? DuckColors.textDark
-                                                  : DuckColors.textLight,
-                                            ),
-                                          ),
-                                        ),
-                                      ],
-                                    ),
-                                  ),
-                            ],
-                          ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 14),
-              Opacity(
-                opacity: onConfirm == null ? 0.45 : 1.0,
-                child: DuckPickButton(
-                  title: '确认取色',
-                  subtitle: picked == null
-                      ? null
-                      : '将复制 ${picked.valueFor(state.copyFormat)}',
-                  height: 60,
-                  onPressed: onConfirm ?? () {},
-                ),
+    final enabled = onConfirm != null;
+    final label = enabled
+        ? '确认取色 · 复制 ${picked!.valueFor(state.copyFormat)}'
+        : '把圆圈对准要取的颜色';
+    return Opacity(
+      opacity: enabled ? 1.0 : 0.55,
+      child: GestureDetector(
+        onTap: onConfirm,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 30, vertical: 15),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(30),
+            gradient: const LinearGradient(
+              colors: [DuckColors.pickStart, DuckColors.pickEnd],
+            ),
+            boxShadow: [
+              BoxShadow(
+                color: DuckColors.pickEnd.withValues(alpha: 0.4),
+                blurRadius: 18,
+                offset: const Offset(0, 6),
               ),
             ],
+          ),
+          child: Text(
+            label,
+            style: const TextStyle(
+              color: DuckColors.pickText,
+              fontSize: 16,
+              fontWeight: FontWeight.w700,
+            ),
           ),
         ),
       ),
