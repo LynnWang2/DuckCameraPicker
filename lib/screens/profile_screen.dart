@@ -1,3 +1,4 @@
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -91,6 +92,13 @@ class ProfileScreen extends StatelessWidget {
             _SectionCard(
               child: Column(
                 children: [
+                  _SegmentedRow(
+                    icon: Icons.play_circle_outline_rounded,
+                    title: '启动时打开',
+                    groupValue: state.launchTab,
+                    onChanged: state.setLaunchTab,
+                  ),
+                  _divider(dark),
                   _SettingRow(
                     icon: Icons.text_fields_rounded,
                     title: '显示格式',
@@ -297,6 +305,85 @@ class _SettingRow extends StatelessWidget {
               color: dark ? DuckColors.mutedDark : DuckColors.mutedLight,
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+/// iOS 风格分段选择器行：启动时打开哪个标签页。
+class _SegmentedRow extends StatelessWidget {
+  const _SegmentedRow({
+    required this.icon,
+    required this.title,
+    required this.groupValue,
+    required this.onChanged,
+  });
+
+  final IconData icon;
+  final String title;
+  final int groupValue;
+  final ValueChanged<int> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    final text = dark ? DuckColors.textDark : DuckColors.textLight;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Row(
+        children: [
+          Icon(icon, size: 22, color: text),
+          const SizedBox(width: 14),
+          Expanded(
+            child: Text(
+              title,
+              style: TextStyle(
+                fontSize: 16,
+                fontWeight: FontWeight.w600,
+                color: text,
+              ),
+            ),
+          ),
+          CupertinoSlidingSegmentedControl<int>(
+            groupValue: groupValue,
+            padding: const EdgeInsets.all(3),
+            thumbColor: dark
+                ? const Color(0xFF636366)
+                : CupertinoColors.white,
+            backgroundColor: dark
+                ? const Color(0xFF1C1C1E)
+                : const Color(0xFFEEEEF0),
+            onValueChanged: (v) {
+              if (v != null) onChanged(v);
+            },
+            children: <int, Widget>{
+              0: _SegLabel('历史', dark: dark),
+              1: _SegLabel('取色', dark: dark),
+              2: _SegLabel('我的', dark: dark),
+            },
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SegLabel extends StatelessWidget {
+  const _SegLabel(this.text, {required this.dark});
+
+  final String text;
+  final bool dark;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      child: Text(
+        text,
+        style: TextStyle(
+          fontSize: 13,
+          color: dark ? Colors.white : Colors.black,
         ),
       ),
     );

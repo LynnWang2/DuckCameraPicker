@@ -1,4 +1,6 @@
 import 'dart:async';
+import 'dart:io';
+import 'dart:math' as math;
 import 'dart:ui';
 import 'dart:ui' as ui;
 
@@ -16,10 +18,14 @@ import '../theme/duck_theme.dart';
 
 /// 相机取色页（中间标签页）：实时预览 + 中央取色点。
 /// - 标签栏上方的相机按钮：按下定格画面，定格后变成 X 按钮，按下回到实时取色
-/// - 定格原理：直接截取当前预览画面（RepaintBoundary.toImage），
-///   全程不调用 takePicture、不动预览用例——CameraX 的 takePicture 会解绑
-///   Preview 用例导致预览变黑，这是之前黑屏 bug 的根因；
-///   截取的帧与用户看到的画面逐像素一致，不存在"定格比实时模糊"的问题
+/// - 定格原理（三级防护，见 _freeze）：
+///   1. 优先截取当前预览帧（RepaintBoundary.toImage），不碰相机、无闪屏；
+///   2. 若截图全黑（部分机型抓不到 Texture），兜底走 takePicture 拍照；
+///      imageCapture 在初始化时已随 preview 一起绑定，takePicture 内部的
+///      bindToLifecycle 会直接 early return，不会解绑预览（已用插件源码验证）；
+///   3. 任何一步失败都留在实时预览并提示，绝不显示黑图、绝不卡死
+/// - 定格后：取色点可跟随单指拖动，取色结果实时变化；
+///   双指缩放定格图（数字变焦，矩阵手势驱动）
 /// - 定格后：取色点可跟随单指拖动，取色结果实时变化；
 ///   双指缩放定格图（数字变焦，矩阵手势驱动）
 /// - 相机按钮上方：高斯模糊圆角矩形颜色卡片（色块 + 中文名 + 色值 + 保存按钮）
@@ -34,23 +40,32 @@ class CameraPage extends StatefulWidget {
   State<CameraPage> createState() => _CameraPageState();
 }
 
-class _CameraPageState extends State<CameraPage> {
-  CameraController? _controller;
+/// 定格图：ui.Image + RGBA 像素 + 尺寸（截图 pr 仅用于截图路径的映射）。
+class _PreviewShot {
+  final ui.Image image;
+  final Uint8List pixels;
+  final int width;
+  final int height;
+  final double pr;
+  _PreviewShot(this.image, this.pixels, this.width, this.height, this.pr);
+}
+
+class _CameraPageState extends State<CameraPage> {  CameraController? _controller;
   CameraImage? _latestFrame;
   Timer? _sampleTimer;
   SampledPixel? _current;
   String? _error;
   bool _flashOn = false;
 
-  // 定格画面：直接截取预览当前帧（见 _freeze），全程不动相机预览，
-  // 从根上杜绝黑屏。定格图用 RawImage 直接显示 dart:ui Image，
-  // 取色直接读 RGBA 像素，无需二次解码。
+  // 定格画面：三级防护（见 _freeze），绝不显示黑图。
+  // 定格图用 RawImage 直接显示 dart:ui Image，取色直接读 RGBA 像素。
   bool _frozen = false;
   ui.Image? _frozenImage;
-  ByteData? _frozenRgba;
+  Uint8List? _frozenRgba;
   int _frozenW = 0;
   int _frozenH = 0;
-  double _frozenPr = 1.0;
+  // 屏幕坐标 -> 定格图像素坐标的映射（截图用 pr 直乘，拍照用 cover 映射）。
+  Offset Function(Offset)? _frozenToPixel;
   double _frozenOpacity = 0.0;
   bool _capturing = false; // 定格进行中，防止重复点击
   final GlobalKey _previewKey = GlobalKey();
@@ -203,65 +218,231 @@ class _CameraPageState extends State<CameraPage> {
     }
   }
 
-  /// 定格画面：截取预览当前帧显示。
+  /// 定格画面：三级防护，绝不显示黑图、绝不卡死。
   ///
-  /// 黑屏根因（已用插件源码验证）：CameraX 插件的 takePicture() 内部调用
-  /// bindToLifecycle([imageCapture])，按 CameraX 语义会解绑 Preview 用例，
-  /// 预览纹理直接变黑，且插件之后不再把 Preview 绑回来；
-  /// 若拍照抛异常/卡住，回退分支只重绑了 ImageAnalysis，预览永久黑屏。
-  /// 所以定格全程不再调用 takePicture：只停采样流（预览用例不动），
-  /// 用 RepaintBoundary.toImage() 截取当前预览帧——截到的就是用户看到的画面，
-  /// 任何一步失败都留在实时预览，不存在黑屏中间态。
+  /// 路径 A（优先）：RepaintBoundary.toImage() 截取当前预览帧。不碰相机，
+  /// 无闪屏，截到的就是用户看到的画面。但部分机型上 toImage 抓不到
+  /// Texture 会返回全黑图——用 _isBlackShot 校验，黑图直接丢弃。
+  /// 路径 B（兜底）：takePicture() 拍照。imageCapture 在初始化时已随
+  /// preview 一起绑定，takePicture 内部 bindToLifecycle(imageCapture)
+  /// 会因已绑定而 early return，不会解绑预览（已用插件源码验证）。
+  /// 拍完删文件，只留内存解码图；若输出是横向 sensor 方向则转 90° 对齐竖屏。
+  /// 失败：留在实时预览并 toast，_capturing 一定复位。
   Future<void> _freeze() async {
     final controller = _controller;
     if (controller == null || !controller.value.isInitialized) return;
     if (_frozen || _capturing) return;
-    final boundary = _previewKey.currentContext?.findRenderObject()
-        as RenderRepaintBoundary?;
-    if (boundary == null) return;
     _capturing = true;
     // 只停采样流（clearAnalyzer），预览用例保持绑定、一直渲染。
     _stopStream();
     try {
-      final pr =
-          MediaQuery.of(context).devicePixelRatio.clamp(1.0, 2.0).toDouble();
-      final uiImage = await boundary.toImage(pixelRatio: pr);
-      final byteData =
-          await uiImage.toByteData(format: ui.ImageByteFormat.rawRgba);
-      if (!mounted || byteData == null) {
-        uiImage.dispose();
-        _startStream();
-        return;
-      }
-      _frozenImage?.dispose();
-      _frozenBaseMatrix = Matrix4.identity();
-      _frozenMatrix.value = Matrix4.identity();
-      _pickPoint.value = null;
-      _lastFrozenSample = null;
-      setState(() {
-        _frozen = true;
-        _frozenImage = uiImage;
-        _frozenRgba = byteData;
-        _frozenW = uiImage.width;
-        _frozenH = uiImage.height;
-        _frozenPr = pr;
-        _frozenOpacity = 0.0;
-      });
-      // 下一帧开始淡入：下面是实时预览，上面是同一帧的截图，过渡无感知。
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted && _frozen) {
-          setState(() => _frozenOpacity = 1.0);
+      var done = false;
+      // —— 路径 A：截图 ——
+      final shot = await _capturePreviewShot()
+          .timeout(const Duration(seconds: 6));
+      if (shot != null && mounted) {
+        if (_isBlackShot(shot.pixels, shot.width, shot.height)) {
+          shot.image.dispose();
+          _toast('截图异常，已切换拍照定格');
+        } else {
+          final pr = shot.pr;
+          _presentFrozen(
+            image: shot.image,
+            rgba: shot.pixels,
+            w: shot.width,
+            h: shot.height,
+            toPixel: (p) => Offset(p.dx * pr, p.dy * pr),
+          );
+          done = true;
         }
-      });
-      // 定格瞬间按中心点采一次。
-      final size = MediaQuery.of(context).size;
-      _sampleFrozenAt(Offset(size.width / 2, size.height / 2));
+      }
+      // —— 路径 B：拍照兜底 ——
+      if (!done) {
+        final file = await controller
+            .takePicture()
+            .timeout(const Duration(seconds: 10));
+        final bytes = await file.readAsBytes();
+        try {
+          await File(file.path).delete();
+        } catch (_) {}
+        if (mounted && bytes.isNotEmpty) {
+          final photo = await _decodePhoto(bytes);
+          if (mounted && photo != null) {
+            // 拍照图用 BoxFit.cover 全屏显示，采样按 cover 映射回像素。
+            final iw = photo.width, ih = photo.height;
+            final size = MediaQuery.of(context).size;
+            final scale = math.max(size.width / iw, size.height / ih);
+            final ox = (size.width - iw * scale) / 2;
+            final oy = (size.height - ih * scale) / 2;
+            _presentFrozen(
+              image: photo.image,
+              rgba: photo.pixels,
+              w: iw,
+              h: ih,
+              toPixel: (p) =>
+                  Offset((p.dx - ox) / scale, (p.dy - oy) / scale),
+            );
+            done = true;
+          } else {
+            photo?.image.dispose();
+          }
+        }
+      }
+      // 两条路都没走通：回到实时预览，绝不留黑屏。
+      if (!done && mounted) _startStream();
     } catch (_) {
-      // 截图失败：回到实时预览。
-      if (mounted) _startStream();
+      if (mounted) {
+        _toast('定格失败，请重试');
+        _startStream();
+      }
     } finally {
       _capturing = false;
     }
+  }
+
+  /// 路径 A：截取预览当前帧，返回 ui.Image + RGBA。失败返回 null。
+  Future<_PreviewShot?> _capturePreviewShot() async {
+    final boundary = _previewKey.currentContext?.findRenderObject()
+        as RenderRepaintBoundary?;
+    if (boundary == null || !mounted) return null;
+    final pr =
+        MediaQuery.of(context).devicePixelRatio.clamp(1.0, 2.0).toDouble();
+    final uiImage = await boundary.toImage(pixelRatio: pr);
+    if (!mounted) {
+      uiImage.dispose();
+      return null;
+    }
+    final w = uiImage.width, h = uiImage.height;
+    if (w <= 0 || h <= 0) {
+      uiImage.dispose();
+      return null;
+    }
+    final bd = await uiImage.toByteData(format: ui.ImageByteFormat.rawRgba);
+    if (bd == null || bd.lengthInBytes < w * h * 4) {
+      uiImage.dispose();
+      return null;
+    }
+    return _PreviewShot(
+      uiImage,
+      bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes),
+      w,
+      h,
+      pr,
+    );
+  }
+
+  /// 截图黑帧校验：部分机型 toImage 抓不到 Texture 会返回全黑图。
+  /// 实时画面不黑但截图中心全黑 → 判定截图失败。
+  bool _isBlackShot(Uint8List pixels, int w, int h) {
+    var sum = 0, n = 0;
+    final cx = w ~/ 2, cy = h ~/ 2;
+    for (var y = cy - 2; y <= cy + 2; y++) {
+      if (y < 0 || y >= h) continue;
+      for (var x = cx - 2; x <= cx + 2; x++) {
+        if (x < 0 || x >= w) continue;
+        final o = (y * w + x) * 4;
+        if (o + 2 >= pixels.length) continue;
+        final r = pixels[o], g = pixels[o + 1], b = pixels[o + 2];
+        sum += (0.299 * r + 0.587 * g + 0.114 * b).round();
+        n++;
+      }
+    }
+    if (n == 0) return true;
+    final shotLum = sum / n;
+    final live = _current;
+    if (live == null) return shotLum < 12;
+    final liveLum = 0.299 * live.r + 0.587 * live.g + 0.114 * live.b;
+    return shotLum < 18 && liveLum > 45;
+  }
+
+  /// 路径 B：把拍照 JPEG 解码为 ui.Image + RGBA。
+  /// 若输出是横向 sensor 方向（宽>高）而屏幕是竖屏，用 Canvas 顺时针
+  /// 转 90° 对齐预览（GPU 绘制，比 isolate 字节旋转更快）。
+  Future<_PreviewShot?> _decodePhoto(Uint8List bytes) async {
+    if (!mounted) return null;
+    final size = MediaQuery.of(context).size;
+    final codec = await ui.instantiateImageCodec(bytes);
+    final frame = await codec.getNextFrame();
+    var img = frame.image;
+    var w = img.width, h = img.height;
+    if (w <= 0 || h <= 0) {
+      img.dispose();
+      return null;
+    }
+    if (size.height >= size.width && w > h) {
+      final recorder = ui.PictureRecorder();
+      final canvas = Canvas(recorder);
+      canvas.translate(h / 2.0, w / 2.0);
+      canvas.rotate(math.pi / 2);
+      canvas.drawImage(img, Offset(-w / 2.0, -h / 2.0), Paint());
+      final picture = recorder.endRecording();
+      img.dispose();
+      img = await picture.toImage(h, w);
+      picture.dispose();
+      final t = w;
+      w = h;
+      h = t;
+    }
+    final bd = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
+    if (bd == null || bd.lengthInBytes < w * h * 4) {
+      img.dispose();
+      return null;
+    }
+    return _PreviewShot(
+      img,
+      bd.buffer.asUint8List(bd.offsetInBytes, bd.lengthInBytes),
+      w,
+      h,
+      1.0,
+    );
+  }
+
+  /// 显示定格图：淡入 + 中心采样。调用前已保证 mounted。
+  void _presentFrozen({
+    required ui.Image image,
+    required Uint8List rgba,
+    required int w,
+    required int h,
+    required Offset Function(Offset) toPixel,
+  }) {
+    if (!mounted) {
+      image.dispose();
+      return;
+    }
+    _frozenImage?.dispose();
+    _frozenImage = image;
+    _frozenRgba = rgba;
+    _frozenW = w;
+    _frozenH = h;
+    _frozenToPixel = toPixel;
+    _frozenBaseMatrix = Matrix4.identity();
+    _frozenMatrix.value = Matrix4.identity();
+    _pickPoint.value = null;
+    _lastFrozenSample = null;
+    setState(() {
+      _frozen = true;
+      _frozenOpacity = 0.0;
+    });
+    // 下一帧开始淡入。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _frozen) {
+        setState(() => _frozenOpacity = 1.0);
+      }
+    });
+    // 定格瞬间按中心点采一次。
+    final size = MediaQuery.of(context).size;
+    _sampleFrozenAt(Offset(size.width / 2, size.height / 2));
+  }
+
+  void _toast(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(msg),
+        duration: const Duration(seconds: 2),
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
   }
 
   /// 回到实时取色：预览从未动过，直接释放定格图、重启采样流。
@@ -273,6 +454,7 @@ class _CameraPageState extends State<CameraPage> {
     _frozenRgba = null;
     _frozenW = 0;
     _frozenH = 0;
+    _frozenToPixel = null;
     _frozenOpacity = 0.0;
     _pickPoint.value = null;
     _frozenMatrix.value = Matrix4.identity();
@@ -340,19 +522,19 @@ class _CameraPageState extends State<CameraPage> {
   }
 
   /// 在定格帧的 RGBA 像素上，按取色点的屏幕坐标采样颜色。
-  /// 定格图就是预览截屏（pixelRatio = _frozenPr），屏幕坐标直接乘 pr 即可，
-  /// 无需 cover 映射、无需考虑旋转。
+  /// 先去掉数字变焦矩阵，再用 _frozenToPixel 映射到定格图像素。
   void _sampleFrozenAt(Offset point) {
-    final data = _frozenRgba;
-    if (data == null || !mounted) return;
+    final bytes = _frozenRgba;
+    final toPixel = _frozenToPixel;
+    if (bytes == null || toPixel == null || !mounted) return;
     final w = _frozenW, h = _frozenH;
     if (w == 0 || h == 0) return;
-    final bytes = data.buffer.asUint8List();
-    // 先去掉数字变焦矩阵，再映射到截图像素。
+    // 先去掉数字变焦矩阵，再映射到定格图像素。
     final inv = Matrix4.inverted(_frozenMatrix.value);
-    final q = inv.transform3(Vector3(point.dx, point.dy, 0));
-    final cx = (q.x * _frozenPr).round().clamp(0, w - 1);
-    final cy = (q.y * _frozenPr).round().clamp(0, h - 1);
+    final s = inv.transform3(Vector3(point.dx, point.dy, 0));
+    final ip = toPixel(Offset(s.x, s.y));
+    final cx = ip.dx.round().clamp(0, w - 1);
+    final cy = ip.dy.round().clamp(0, h - 1);
     var r = 0, g = 0, b = 0, n = 0;
     for (var y = cy - 2; y <= cy + 2; y++) {
       if (y < 0 || y >= h) continue;

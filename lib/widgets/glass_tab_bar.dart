@@ -49,36 +49,36 @@ class GlassTabBar extends StatelessWidget {
                 ),
               ],
             ),
-            child: Row(
-              children: [
-                Expanded(
-                  child: _TabItem(
+            child: Center(
+              child: Row(
+                // 三个按钮居中收拢：固定宽度 + 小间距，缩短按钮之间的距离。
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  _TabItem(
                     icon: Icons.history_rounded,
                     label: '历史',
                     selected: currentIndex == 0,
                     dark: dark,
                     onTap: onHistoryTap,
                   ),
-                ),
-                Expanded(
-                  child: _TabItem(
+                  const SizedBox(width: 2),
+                  _TabItem(
                     icon: Icons.photo_camera_outlined,
                     label: '取色',
                     selected: currentIndex == 1,
                     dark: dark,
                     onTap: onCameraTap,
                   ),
-                ),
-                Expanded(
-                  child: _TabItem(
+                  const SizedBox(width: 2),
+                  _TabItem(
                     icon: Icons.person_outline_rounded,
                     label: '我的',
                     selected: currentIndex == 2,
                     dark: dark,
                     onTap: onProfileTap,
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
           ),
         ),
@@ -104,22 +104,24 @@ class _TabItem extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    // 选中时显示紧贴内容的小圆角矩形（参考图一），不拉长成大胶囊。
+    // 选中项：加宽的半透明暗色小胶囊（参考图一比例）。
+    // 正片叠底等效：半透明黑色直接画在磨砂底上，数学上与 multiply 结果一致。
     final fg = dark ? Colors.white : const Color(0xFF111111);
     return GestureDetector(
       onTap: onTap,
       behavior: HitTestBehavior.opaque,
-      child: Center(
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
-          decoration: selected
-              ? BoxDecoration(
-                  color: dark
-                      ? const Color(0xFF2C2C30)
-                      : const Color(0xFFE9E9EE),
-                  borderRadius: BorderRadius.circular(18),
-                )
-              : null,
+      child: SizedBox(
+        width: 88,
+        child: Center(
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 26, vertical: 7),
+            decoration: selected
+                ? BoxDecoration(
+                    color: Colors.black.withValues(
+                        alpha: dark ? 0.45 : 0.10),
+                    borderRadius: BorderRadius.circular(20),
+                  )
+                : null,
           child: Column(
             mainAxisSize: MainAxisSize.min,
             mainAxisAlignment: MainAxisAlignment.center,
@@ -137,6 +139,7 @@ class _TabItem extends StatelessWidget {
             ],
           ),
         ),
+      ),
       ),
     );
   }

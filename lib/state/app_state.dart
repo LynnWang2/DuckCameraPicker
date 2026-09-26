@@ -12,12 +12,14 @@ class AppState extends ChangeNotifier {
   static const _kTheme = 'duck.theme.v1';
   static const _kDisplayFormat = 'duck.displayFormat.v1';
   static const _kStripHashOnCopy = 'duck.stripHashOnCopy.v1';
+  static const _kLaunchTab = 'duck.launchTab.v1';
   static const int maxHistory = 50;
 
   List<PickedColor> _history = [];
   ThemeMode _themeMode = ThemeMode.system;
   ColorFormat _displayFormat = ColorFormat.hex;
   bool _stripHashOnCopy = false;
+  int _launchTab = 1;
   bool _loaded = false;
 
   List<PickedColor> get history => List.unmodifiable(_history);
@@ -26,6 +28,9 @@ class AppState extends ChangeNotifier {
 
   /// 复制 HEX 时去掉 #（只影响复制，不影响显示）。
   bool get stripHashOnCopy => _stripHashOnCopy;
+
+  /// 启动时打开的标签页：0=历史，1=取色，2=我的。
+  int get launchTab => _launchTab;
   bool get loaded => _loaded;
 
   Future<void> load() async {
@@ -40,6 +45,7 @@ class AppState extends ChangeNotifier {
     _themeMode = ThemeMode.values[prefs.getInt(_kTheme) ?? 0];
     _displayFormat = _migrateDisplayFormat(prefs.getInt(_kDisplayFormat));
     _stripHashOnCopy = prefs.getBool(_kStripHashOnCopy) ?? false;
+    _launchTab = (prefs.getInt(_kLaunchTab) ?? 1).clamp(0, 2);
     _loaded = true;
     notifyListeners();
   }
@@ -69,6 +75,7 @@ class AppState extends ChangeNotifier {
     await prefs.setInt(_kTheme, _themeMode.index);
     await prefs.setInt(_kDisplayFormat, _displayFormat.index);
     await prefs.setBool(_kStripHashOnCopy, _stripHashOnCopy);
+    await prefs.setInt(_kLaunchTab, _launchTab);
   }
 
   void addColor(PickedColor color) {
@@ -106,6 +113,12 @@ class AppState extends ChangeNotifier {
 
   void setStripHashOnCopy(bool value) {
     _stripHashOnCopy = value;
+    _persist();
+    notifyListeners();
+  }
+
+  void setLaunchTab(int index) {
+    _launchTab = index.clamp(0, 2);
     _persist();
     notifyListeners();
   }

@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:provider/provider.dart';
 
+import '../state/app_state.dart';
 import '../theme/duck_theme.dart';
 import '../widgets/glass_tab_bar.dart';
 import 'camera_screen.dart';
@@ -17,7 +19,39 @@ class MainShell extends StatefulWidget {
 }
 
 class _MainShellState extends State<MainShell> {
-  int _index = 0;
+  // 默认取色；AppState 异步加载完成后会按用户的“启动时打开”设置校准。
+  int _index = 1;
+  bool _userNavigated = false;
+
+  @override
+  void initState() {
+    super.initState();
+    final state = context.read<AppState>();
+    if (state.loaded) {
+      _applyLaunchTab(state);
+    } else {
+      void listener() {
+        if (!state.loaded) return;
+        state.removeListener(listener);
+        _applyLaunchTab(state);
+      }
+
+      state.addListener(listener);
+    }
+  }
+
+  void _applyLaunchTab(AppState state) {
+    if (_userNavigated) return;
+    final idx = state.launchTab.clamp(0, 2);
+    if (idx != _index && mounted) setState(() => _index = idx);
+  }
+
+  void _goTo(int index) {
+    setState(() {
+      _index = index;
+      _userNavigated = true;
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -50,9 +84,9 @@ class _MainShellState extends State<MainShell> {
               bottom: 0,
               child: GlassTabBar(
                 currentIndex: _index,
-                onHistoryTap: () => setState(() => _index = 0),
-                onCameraTap: () => setState(() => _index = 1),
-                onProfileTap: () => setState(() => _index = 2),
+                onHistoryTap: () => _goTo(0),
+                onCameraTap: () => _goTo(1),
+                onProfileTap: () => _goTo(2),
               ),
             ),
           ],
