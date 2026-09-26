@@ -104,7 +104,7 @@ class _TabItem extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    // 选中项：加宽的半透明暗色小胶囊（参考图一比例）。
+    // 选中项：真胶囊形（大圆角 = 高度一半）、左右加长的半透明暗色底。
     // 正片叠底等效：半透明黑色直接画在磨砂底上，数学上与 multiply 结果一致。
     final fg = dark ? Colors.white : const Color(0xFF111111);
     return GestureDetector(
@@ -114,12 +114,13 @@ class _TabItem extends StatelessWidget {
         width: 88,
         child: Center(
           child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 26, vertical: 7),
+            width: 86,
+            height: 58,
             decoration: selected
                 ? BoxDecoration(
                     color: Colors.black.withValues(
                         alpha: dark ? 0.45 : 0.10),
-                    borderRadius: BorderRadius.circular(20),
+                    borderRadius: BorderRadius.circular(29),
                   )
                 : null,
           child: Column(
