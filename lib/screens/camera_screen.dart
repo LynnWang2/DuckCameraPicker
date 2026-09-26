@@ -1,10 +1,10 @@
 import 'dart:async';
-import 'dart:io';
-import 'dart:math' as math;
 import 'dart:ui';
+import 'dart:ui' as ui;
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
@@ -39,13 +39,14 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
   String? _error;
   bool _flashOn = false;
 
-  // 定格画面：v0.3.0 验证过的 takePicture 路径。
-  // 只停图像采样流（clearAnalyzer），预览用例保持绑定；
-  // 绝不调用 pausePreview（它会暂停预览纹理，是黑屏的引入者）。
-  // 显示用 Image.file(JPEG)，取色点采样用后台解码的 RGBA。
+  // 定格画面取自当前 Flutter 预览帧。不要调用 takePicture：CameraX
+  // 拍照时会解绑 Preview 用例，导致预览纹理黑屏。
   bool _frozen = false;
-  XFile? _frozenFile;
-  _FrozenPixels? _frozenPixels;
+  ui.Image? _frozenImage;
+  ByteData? _frozenRgba;
+  int _frozenW = 0;
+  int _frozenH = 0;
+  final GlobalKey _previewKey = GlobalKey();
   bool _capturing = false; // 定格进行中，防止重复点击
 
   // 定格后取色点位置（屏幕坐标；null = 画面中心）
@@ -191,90 +192,55 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
     }
   }
 
-  /// 定格画面：v0.3.0 验证过的路径。
-  /// 只停图像采样流（clearAnalyzer），预览用例保持绑定、一直渲染；
-  /// 然后 takePicture，用 Image.file 直接显示。绝不 pausePreview、
-  /// 绝不 toImage。任何失败都留在实时预览并 toast。
+  /// 定格当前预览帧，不调用原生拍照接口，因此相机预览纹理保持有效。
   Future<void> _freeze() async {
     final controller = _controller;
     if (controller == null || !controller.value.isInitialized) return;
     if (_frozen || _capturing) return;
+    final boundary = _previewKey.currentContext?.findRenderObject()
+        as RenderRepaintBoundary?;
+    if (boundary == null || boundary.debugNeedsPaint) return;
     _capturing = true;
     _stopStream();
     try {
-      final file = await controller.takePicture();
-      if (!mounted) return;
-      _presentFrozen(file);
-      // 后台解码 JPEG 供取色点采样，不阻塞 UI。
-      unawaited(_decodeFrozen(file));
-    } catch (_) {
-      if (mounted) {
-        _toast('定格失败，请重试');
+      final pixelRatio =
+          MediaQuery.of(context).devicePixelRatio.clamp(1.0, 2.0).toDouble();
+      final image = await boundary.toImage(pixelRatio: pixelRatio);
+      final data = await image.toByteData(format: ui.ImageByteFormat.rawRgba);
+      if (!mounted || data == null) {
+        image.dispose();
         _startStream();
+        return;
       }
+      _frozenImage?.dispose();
+      _pickPoint.value = null;
+      _lastFrozenSample = null;
+      setState(() {
+        _frozen = true;
+        _frozenImage = image;
+        _frozenRgba = data;
+        _frozenW = image.width;
+        _frozenH = image.height;
+      });
+      final size = MediaQuery.of(context).size;
+      _sampleFrozenAt(Offset(size.width / 2, size.height / 2));
+    } catch (_) {
+      if (mounted) _startStream();
     } finally {
       _capturing = false;
     }
   }
 
-  /// 后台解码定格 JPEG 为 RGBA，供拖动取色点采样。
-  /// 解码完成后按中心点采一次。失败也不影响图片显示。
-  Future<void> _decodeFrozen(XFile file) async {
-    try {
-      final bytes = await file.readAsBytes();
-      final codec = await instantiateImageCodec(bytes);
-      final frameInfo = await codec.getNextFrame();
-      final img = frameInfo.image;
-      final w = img.width;
-      final h = img.height;
-      final bd = await img.toByteData(format: ImageByteFormat.rawRgba);
-      img.dispose();
-      if (bd == null || !mounted) return;
-      // 只在仍是这次定格时生效，防止旧解码覆盖新定格。
-      if (_frozenFile?.path != file.path) return;
-      _frozenPixels = _FrozenPixels(bd.buffer.asUint8List(), w, h);
-      final size = MediaQuery.of(context).size;
-      _sampleFrozenAt(Offset(size.width / 2, size.height / 2));
-    } catch (_) {
-      // 解码失败：图片照常显示，取色点保持上次颜色。
-    }
-  }
-
-  /// 显示定格图。调用前已保证 mounted。
-  void _presentFrozen(XFile file) {
-    if (!mounted) return;
-    _frozenFile = file;
-    _frozenPixels = null;
-    _pickPoint.value = null;
-    _lastFrozenSample = null;
-    setState(() => _frozen = true);
-    // JPEG 解码完成后（_decodeFrozen）再按中心点采样。
-  }
-
-  void _toast(String msg) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(msg),
-        duration: const Duration(seconds: 2),
-        behavior: SnackBarBehavior.floating,
-      ),
-    );
-  }
-
-  /// 回到实时取色：删除定格 JPEG，重启采样流。
+  /// 回到实时取色并释放定格帧。
   Future<void> _unfreeze() async {
     if (!_frozen) return;
     _frozen = false;
-    final f = _frozenFile;
-    _frozenFile = null;
-    _frozenPixels = null;
+    _frozenImage?.dispose();
+    _frozenImage = null;
+    _frozenRgba = null;
+    _frozenW = 0;
+    _frozenH = 0;
     _pickPoint.value = null;
-    if (f != null) {
-      try {
-        await File(f.path).delete();
-      } catch (_) {}
-    }
     if (!mounted) return;
     setState(() {});
     _startStream();
@@ -338,20 +304,16 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
     if (p != null) _sampleFrozenAt(p);
   }
 
-  /// 在定格 JPEG 的 RGBA 像素上，按取色点的屏幕坐标采样颜色。
-  /// 按 BoxFit.cover 映射到图像像素。
+  /// 在定格预览帧的 RGBA 像素上，按取色点位置采样颜色。
   void _sampleFrozenAt(Offset point) {
-    final px = _frozenPixels;
-    if (px == null || !mounted) return;
-    final bytes = px.rgba;
-    final w = px.width, h = px.height;
+    final data = _frozenRgba;
+    if (data == null || !mounted) return;
+    final bytes = data.buffer.asUint8List();
+    final w = _frozenW, h = _frozenH;
     if (w == 0 || h == 0) return;
     final size = MediaQuery.of(context).size;
-    final scale = math.max(size.width / w, size.height / h);
-    final ox = (size.width - w * scale) / 2;
-    final oy = (size.height - h * scale) / 2;
-    final cx = ((point.dx - ox) / scale).round().clamp(0, w - 1);
-    final cy = ((point.dy - oy) / scale).round().clamp(0, h - 1);
+    final cx = (point.dx / size.width * w).round().clamp(0, w - 1);
+    final cy = (point.dy / size.height * h).round().clamp(0, h - 1);
     var r = 0, g = 0, b = 0, n = 0;
     for (var y = cy - 2; y <= cy + 2; y++) {
       if (y < 0 || y >= h) continue;
@@ -398,8 +360,9 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
     _zoomHideTimer?.cancel();
     _pickPoint.dispose();
     _zoomBadge.dispose();
-    _frozenFile = null;
-    _frozenPixels = null;
+    _frozenImage?.dispose();
+    _frozenImage = null;
+    _frozenRgba = null;
     final controller = _controller;
     _controller = null;
     if (controller != null) unawaited(_disposeController(controller));
@@ -425,13 +388,15 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
         extendBody: true,
         body: Stack(
           children: [
-            // 定格时直接用 JPEG 替换预览（v0.3.0 一模一样的显示方式），
-            // 不叠加、不淡入。手势只保留拖动取色点。
+            // 预览保持在底层，定格帧覆盖其上；相机预览纹理不会被拍照接口解绑。
             Positioned.fill(
-              child: (frozen && _frozenFile != null)
-                  ? _buildFrozenV030()
-                  : _buildLive(controller),
+              child: RepaintBoundary(
+                key: _previewKey,
+                child: _buildLive(controller),
+              ),
             ),
+            if (frozen && _frozenImage != null)
+              Positioned.fill(child: _buildFrozen()),
             if (_error != null)
               Positioned.fill(
                 child: Container(
@@ -558,32 +523,22 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
     );
   }
 
-  /// 定格画面：v0.3.0 一模一样的显示——Image.file 直接替换预览，
-  /// 不叠加、不淡入、不 Transform。只包一层手势做拖动取色点。
-  Widget _buildFrozenV030() {
-    final file = _frozenFile;
-    if (file == null) return const SizedBox.shrink();
+  /// 覆盖显示截图，并保留拖动取样手势。
+  Widget _buildFrozen() {
+    final image = _frozenImage;
+    if (image == null) return const SizedBox.shrink();
     return GestureDetector(
       onTapDown: _onFrozenTapDown,
       onPanUpdate: _onFrozenPanUpdate,
       onPanEnd: _onFrozenPanEnd,
       child: SizedBox.expand(
-        child: Image.file(
-          File(file.path),
+        child: RawImage(
+          image: image,
           fit: BoxFit.cover,
         ),
       ),
     );
   }
-}
-
-/// 定格 JPEG 后台解码出的 RGBA 像素（4 字节/像素），供拖动取色点采样。
-class _FrozenPixels {
-  const _FrozenPixels(this.rgba, this.width, this.height);
-
-  final Uint8List rgba;
-  final int width;
-  final int height;
 }
 
 /// 预览填满屏幕（cover 裁剪，不变形）。
