@@ -37,9 +37,12 @@ class _CameraPageState extends State<CameraPage> {
   String? _error;
   bool _flashOn = false;
 
-  // 先恢复早期已验证的定格照片流程，暂时关闭冻结后的拖动取色。
+  // 保持已验证的拍照定格流程，并缓存静态照片像素供取色。
   bool _frozen = false;
   XFile? _frozenFile;
+  ByteData? _frozenRgba;
+  int _frozenWidth = 0;
+  int _frozenHeight = 0;
   bool _capturing = false; // 定格进行中，防止重复点击
   double _frozenOpacity = 0;
 
@@ -219,6 +222,9 @@ class _CameraPageState extends State<CameraPage> {
 
   void _presentFrozen(XFile photo) {
     _frozenFile = photo;
+    _frozenRgba = null;
+    _frozenWidth = 0;
+    _frozenHeight = 0;
     _pickPoint.value = null;
     _lastFrozenSample = null;
     setState(() {
@@ -228,6 +234,88 @@ class _CameraPageState extends State<CameraPage> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted && _frozen) setState(() => _frozenOpacity = 1);
     });
+    unawaited(_decodeFrozenPhoto(photo));
+  }
+
+  /// Decode the captured photo once; the full-resolution JPEG remains visible.
+  Future<void> _decodeFrozenPhoto(XFile photo) async {
+    try {
+      final codec = await instantiateImageCodec(await photo.readAsBytes());
+      try {
+        final frame = await codec.getNextFrame();
+        try {
+          final rgba = await frame.image.toByteData(
+            format: ImageByteFormat.rawRgba,
+          );
+          if (rgba == null || !mounted || !_frozen) return;
+          if (_frozenFile?.path != photo.path) return;
+          _frozenRgba = rgba;
+          _frozenWidth = frame.image.width;
+          _frozenHeight = frame.image.height;
+          final size = MediaQuery.of(context).size;
+          _sampleFrozenAt(
+            _pickPoint.value ?? Offset(size.width / 2, size.height / 2),
+          );
+        } finally {
+          frame.image.dispose();
+        }
+      } finally {
+        codec.dispose();
+      }
+    } catch (_) {
+      if (mounted && _frozenFile?.path == photo.path) {
+        _toast('定格照片可正常显示，但暂时无法取色');
+      }
+    }
+  }
+
+  void _movePickPoint(Offset point) {
+    final size = MediaQuery.of(context).size;
+    final clamped = Offset(
+      point.dx.clamp(0.0, size.width),
+      point.dy.clamp(0.0, size.height),
+    );
+    _pickPoint.value = clamped;
+    final now = DateTime.now();
+    if (_lastFrozenSample == null ||
+        now.difference(_lastFrozenSample!) >=
+            const Duration(milliseconds: 60)) {
+      _lastFrozenSample = now;
+      _sampleFrozenAt(clamped);
+    }
+  }
+
+  void _sampleFrozenAt(Offset point) {
+    final rgba = _frozenRgba;
+    final width = _frozenWidth;
+    final height = _frozenHeight;
+    if (rgba == null || width == 0 || height == 0 || !mounted) return;
+
+    final size = MediaQuery.of(context).size;
+    final scale = math.max(size.width / width, size.height / height).toDouble();
+    final offsetX = (size.width - width * scale) / 2;
+    final offsetY = (size.height - height * scale) / 2;
+    final x =
+        ((point.dx - offsetX) / scale).round().clamp(0, width - 1).toInt();
+    final y =
+        ((point.dy - offsetY) / scale).round().clamp(0, height - 1).toInt();
+
+    var red = 0, green = 0, blue = 0, count = 0;
+    for (var sampleY = y - 2; sampleY <= y + 2; sampleY++) {
+      if (sampleY < 0 || sampleY >= height) continue;
+      for (var sampleX = x - 2; sampleX <= x + 2; sampleX++) {
+        if (sampleX < 0 || sampleX >= width) continue;
+        final offset = (sampleY * width + sampleX) * 4;
+        if (offset + 2 >= rgba.lengthInBytes) continue;
+        red += rgba.getUint8(offset);
+        green += rgba.getUint8(offset + 1);
+        blue += rgba.getUint8(offset + 2);
+        count++;
+      }
+    }
+    if (count == 0) return;
+    setState(() =>
+        _current = SampledPixel(red ~/ count, green ~/ count, blue ~/ count));
   }
 
   void _toast(String message) {
@@ -247,6 +335,9 @@ class _CameraPageState extends State<CameraPage> {
     _frozen = false;
     final photo = _frozenFile;
     _frozenFile = null;
+    _frozenRgba = null;
+    _frozenWidth = 0;
+    _frozenHeight = 0;
     _frozenOpacity = 0;
     _pickPoint.value = null;
     if (photo != null) {
@@ -309,6 +400,7 @@ class _CameraPageState extends State<CameraPage> {
     _pickPoint.dispose();
     _zoomBadge.dispose();
     _frozenFile = null;
+    _frozenRgba = null;
     final controller = _controller;
     _controller = null;
     if (controller != null) unawaited(_disposeController(controller));
@@ -334,8 +426,10 @@ class _CameraPageState extends State<CameraPage> {
         extendBody: true,
         body: Stack(
           children: [
-            // 保持预览层常驻，早期 JPEG 照片显示在预览上层。
-            Positioned.fill(child: _buildLive(controller)),
+            // 定格时卸载相机纹理，只保留独立照片图层。继续在底层绘制
+            // CameraPreview 会在取色 setState 重建时触发原生纹理重绘，
+            // 某些设备上会让整块预览区域变黑并盖住 Flutter 图层。
+            if (!frozen) Positioned.fill(child: _buildLive(controller)),
             if (frozen && _frozenFile != null)
               Positioned.fill(child: _buildFrozen()),
             if (_error != null)
@@ -365,7 +459,29 @@ class _CameraPageState extends State<CameraPage> {
                   ),
                 ),
               ),
-            const Center(child: _PickDot()),
+            if (!frozen)
+              const Center(child: _PickDot())
+            else
+              ValueListenableBuilder<Offset?>(
+                valueListenable: _pickPoint,
+                builder: (context, point, _) {
+                  final size = MediaQuery.of(context).size;
+                  final position =
+                      point ?? Offset(size.width / 2, size.height / 2);
+                  // Keep a normal render widget as the Stack child. Returning
+                  // Positioned from this listener can fail parent-data setup
+                  // in release builds when the frozen branch first appears.
+                  return SizedBox.expand(
+                    child: Align(
+                      alignment: Alignment.topLeft,
+                      child: Transform.translate(
+                        offset: position - const Offset(9, 9),
+                        child: const IgnorePointer(child: _PickDot()),
+                      ),
+                    ),
+                  );
+                },
+              ),
             // 缩放倍数指示（只重建徽标本身）：与右上角闪光灯按钮垂直居中对齐
             // （闪光灯 40 高、顶部 8；徽标放在同样的 40 高区域内居中）。
             ValueListenableBuilder<double?>(
@@ -449,18 +565,29 @@ class _CameraPageState extends State<CameraPage> {
     );
   }
 
-  /// 覆盖显示截图，并保留拖动取样手势。
+  /// 显示定格照片，并允许单指拖动取色点。
   Widget _buildFrozen() {
     final photo = _frozenFile;
     if (photo == null) return const SizedBox.shrink();
-    return AnimatedOpacity(
-      opacity: _frozenOpacity,
-      duration: const Duration(milliseconds: 160),
-      child: SizedBox.expand(
-        child: Image.file(
-          File(photo.path),
-          fit: BoxFit.cover,
-          gaplessPlayback: true,
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTapDown: (details) => _movePickPoint(details.localPosition),
+      onPanUpdate: (details) => _movePickPoint(details.localPosition),
+      onPanEnd: (_) {
+        final size = MediaQuery.of(context).size;
+        _sampleFrozenAt(
+          _pickPoint.value ?? Offset(size.width / 2, size.height / 2),
+        );
+      },
+      child: AnimatedOpacity(
+        opacity: _frozenOpacity,
+        duration: const Duration(milliseconds: 160),
+        child: SizedBox.expand(
+          child: Image.file(
+            File(photo.path),
+            fit: BoxFit.cover,
+            gaplessPlayback: true,
+          ),
         ),
       ),
     );
