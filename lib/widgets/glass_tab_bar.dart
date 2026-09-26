@@ -49,33 +49,38 @@ class GlassTabBar extends StatelessWidget {
                 ),
               ],
             ),
-            child: Center(
+            child: Padding(
+              // 内边距 8：选中胶囊上下左右与外层大胶囊等距（8px），自适应各种屏幕宽度。
+              padding: const EdgeInsets.all(8),
               child: Row(
-                // 三个按钮居中收拢：固定宽度 + 小间距，缩短按钮之间的距离。
-                mainAxisSize: MainAxisSize.min,
+                // 三个按钮均分宽度，胶囊底填满各自格子，相邻间距同步收紧。
                 children: [
-                  _TabItem(
-                    icon: Icons.history_rounded,
-                    label: '历史',
-                    selected: currentIndex == 0,
-                    dark: dark,
-                    onTap: onHistoryTap,
+                  Expanded(
+                    child: _TabItem(
+                      icon: Icons.history_rounded,
+                      label: '历史',
+                      selected: currentIndex == 0,
+                      dark: dark,
+                      onTap: onHistoryTap,
+                    ),
                   ),
-                  const SizedBox(width: 2),
-                  _TabItem(
-                    icon: Icons.photo_camera_outlined,
-                    label: '取色',
-                    selected: currentIndex == 1,
-                    dark: dark,
-                    onTap: onCameraTap,
+                  Expanded(
+                    child: _TabItem(
+                      icon: Icons.photo_camera_outlined,
+                      label: '取色',
+                      selected: currentIndex == 1,
+                      dark: dark,
+                      onTap: onCameraTap,
+                    ),
                   ),
-                  const SizedBox(width: 2),
-                  _TabItem(
-                    icon: Icons.person_outline_rounded,
-                    label: '我的',
-                    selected: currentIndex == 2,
-                    dark: dark,
-                    onTap: onProfileTap,
+                  Expanded(
+                    child: _TabItem(
+                      icon: Icons.person_outline_rounded,
+                      label: '我的',
+                      selected: currentIndex == 2,
+                      dark: dark,
+                      onTap: onProfileTap,
+                    ),
                   ),
                 ],
               ),
@@ -104,43 +109,36 @@ class _TabItem extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    // 选中项：真胶囊形（大圆角 = 高度一半）、左右加长的半透明暗色底。
+    // 选中项：真胶囊形（圆角 = 高度一半）、填满格子的半透明暗色底。
     // 正片叠底等效：半透明黑色直接画在磨砂底上，数学上与 multiply 结果一致。
     final fg = dark ? Colors.white : const Color(0xFF111111);
     return GestureDetector(
       onTap: onTap,
       behavior: HitTestBehavior.opaque,
-      child: SizedBox(
-        width: 88,
-        child: Center(
-          child: Container(
-            width: 86,
-            height: 58,
-            decoration: selected
-                ? BoxDecoration(
-                    color: Colors.black.withValues(
-                        alpha: dark ? 0.45 : 0.10),
-                    borderRadius: BorderRadius.circular(29),
-                  )
-                : null,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Icon(icon, size: 26, color: fg),
-              const SizedBox(height: 4),
-              Text(
-                label,
-                style: TextStyle(
-                  fontSize: 12,
-                  fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
-                  color: fg,
-                ),
+      child: Container(
+        decoration: selected
+            ? BoxDecoration(
+                color: Colors.black.withValues(
+                    alpha: dark ? 0.45 : 0.10),
+                // 格子高 54（70-16），圆角 27 即为真胶囊。
+                borderRadius: BorderRadius.circular(27),
+              )
+            : null,
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(icon, size: 26, color: fg),
+            const SizedBox(height: 2),
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                color: fg,
               ),
-            ],
-          ),
+            ),
+          ],
         ),
-      ),
       ),
     );
   }

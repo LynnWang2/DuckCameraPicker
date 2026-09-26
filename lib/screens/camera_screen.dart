@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math' as math;
 import 'dart:ui';
 
@@ -8,7 +9,6 @@ import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:vector_math/vector_math_64.dart' show Matrix4, Vector3;
 
-import '../camera/frame_renderer.dart';
 import '../camera/frame_sampler.dart';
 import '../models/picked_color.dart';
 import '../state/app_state.dart';
@@ -16,15 +16,10 @@ import '../theme/duck_theme.dart';
 
 /// 相机取色页（中间标签页）：实时预览 + 中央取色点。
 /// - 标签栏上方的相机按钮：按下定格画面，定格后变成 X 按钮，按下回到实时取色
-/// - 定格原理（三级防护，见 _freeze）：
-///   1. 优先截取当前预览帧（RepaintBoundary.toImage），不碰相机、无闪屏；
-///   2. 若截图全黑（部分机型抓不到 Texture），兜底走 takePicture 拍照；
-///      imageCapture 在初始化时已随 preview 一起绑定，takePicture 内部的
-///      bindToLifecycle 会直接 early return，不会解绑预览（已用插件源码验证）；
-///   3. 任何一步失败都留在实时预览并提示，绝不显示黑图、绝不卡死
-/// - 定格后：取色点可跟随单指拖动，取色结果实时变化；
-///   双指缩放定格图（数字变焦，矩阵手势驱动）
-/// - 定格后：取色点可跟随单指拖动，取色结果实时变化；
+/// - 定格原理（v0.3.0 验证过的路径）：只停图像采样流，调用 takePicture 拍照，
+///   用 Image.file 直接显示 JPEG。绝不调用 pausePreview（它是黑屏的引入者，
+///   会暂停预览纹理），也不调用 toImage 截图。
+/// - 定格后：取色点可跟随单指拖动，取色结果实时变化（后台解码 JPEG 采样）；
 ///   双指缩放定格图（数字变焦，矩阵手势驱动）
 /// - 相机按钮上方：高斯模糊圆角矩形颜色卡片（色块 + 中文名 + 色值 + 保存按钮）
 /// - 实时预览双指缩放：硬件变焦，非阻塞调用 + 节流，避免卡顿
@@ -45,11 +40,13 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
   String? _error;
   bool _flashOn = false;
 
-  // 定格画面：从图像流 YUV 帧纯 Dart 渲染（不调用截图/拍照原生接口，
-  // 不碰任何相机用例，所以不会黑屏、不会卡死）。显示用 Image.memory(BMP)，
-  // 取色直接读 RGB 像素。
+  // 定格画面：v0.3.0 验证过的 takePicture 路径。
+  // 只停图像采样流（clearAnalyzer），预览用例保持绑定；
+  // 绝不调用 pausePreview（它会暂停预览纹理，是黑屏的引入者）。
+  // 显示用 Image.file(JPEG)，取色点采样用后台解码的 RGBA。
   bool _frozen = false;
-  FrozenFrame? _frozenFrame;
+  XFile? _frozenFile;
+  _FrozenPixels? _frozenPixels;
   double _frozenOpacity = 0.0;
   bool _capturing = false; // 定格进行中，防止重复点击
 
@@ -201,30 +198,22 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
     }
   }
 
-  /// 定格画面：从图像流取一帧 YUV 数据（与实时取色同源，已知良好），
-  /// 纯 Dart 转 RGB 并对齐竖屏，编码为 BMP 显示。
-  /// 全程不调用 toImage / takePicture 等原生接口，不碰任何相机用例，
-  /// 所以不会黑屏、不会卡死。任何失败都留在实时预览并 toast。
+  /// 定格画面：v0.3.0 验证过的路径。
+  /// 只停图像采样流（clearAnalyzer），预览用例保持绑定、一直渲染；
+  /// 然后 takePicture，用 Image.file 直接显示。绝不 pausePreview、
+  /// 绝不 toImage。任何失败都留在实时预览并 toast。
   Future<void> _freeze() async {
     final controller = _controller;
     if (controller == null || !controller.value.isInitialized) return;
     if (_frozen || _capturing) return;
-    final frame = _latestFrame;
-    if (frame == null || frame.format.group != ImageFormatGroup.yuv420) {
-      _toast('相机未就绪，请稍候再试');
-      return;
-    }
     _capturing = true;
-    // 只停采样流（clearAnalyzer），预览用例保持绑定、一直渲染。
     _stopStream();
     try {
-      final rendered = renderFrame(frame);
-      if (mounted && rendered != null) {
-        _presentFrozen(rendered);
-      } else {
-        if (mounted) _toast('定格失败，请重试');
-        _startStream();
-      }
+      final file = await controller.takePicture();
+      if (!mounted) return;
+      _presentFrozen(file);
+      // 后台解码 JPEG 供取色点采样，不阻塞 UI。
+      unawaited(_decodeFrozen(file));
     } catch (_) {
       if (mounted) {
         _toast('定格失败，请重试');
@@ -235,10 +224,34 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
     }
   }
 
-  /// 显示定格图：淡入 + 中心采样。调用前已保证 mounted。
-  void _presentFrozen(FrozenFrame frame) {
+  /// 后台解码定格 JPEG 为 RGBA，供拖动取色点采样。
+  /// 解码完成后按中心点采一次。失败也不影响图片显示。
+  Future<void> _decodeFrozen(XFile file) async {
+    try {
+      final bytes = await file.readAsBytes();
+      final codec = await instantiateImageCodec(bytes);
+      final frameInfo = await codec.getNextFrame();
+      final img = frameInfo.image;
+      final w = img.width;
+      final h = img.height;
+      final bd = await img.toByteData(format: ImageByteFormat.rawRgba);
+      img.dispose();
+      if (bd == null || !mounted) return;
+      // 只在仍是这次定格时生效，防止旧解码覆盖新定格。
+      if (_frozenFile?.path != file.path) return;
+      _frozenPixels = _FrozenPixels(bd.buffer.asUint8List(), w, h);
+      final size = MediaQuery.of(context).size;
+      _sampleFrozenAt(Offset(size.width / 2, size.height / 2));
+    } catch (_) {
+      // 解码失败：图片照常显示，取色点保持上次颜色。
+    }
+  }
+
+  /// 显示定格图：淡入。调用前已保证 mounted。
+  void _presentFrozen(XFile file) {
     if (!mounted) return;
-    _frozenFrame = frame;
+    _frozenFile = file;
+    _frozenPixels = null;
     _frozenBaseMatrix = Matrix4.identity();
     _frozenMatrix.value = Matrix4.identity();
     _pickPoint.value = null;
@@ -253,9 +266,7 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
         setState(() => _frozenOpacity = 1.0);
       }
     });
-    // 定格瞬间按中心点采一次。
-    final size = MediaQuery.of(context).size;
-    _sampleFrozenAt(Offset(size.width / 2, size.height / 2));
+    // JPEG 解码完成后（_decodeFrozen）再按中心点采样。
   }
 
   void _toast(String msg) {
@@ -269,14 +280,21 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
     );
   }
 
-  /// 回到实时取色：预览从未动过，直接释放定格图、重启采样流。
+  /// 回到实时取色：删除定格 JPEG，重启采样流。
   Future<void> _unfreeze() async {
     if (!_frozen) return;
     _frozen = false;
-    _frozenFrame = null;
+    final f = _frozenFile;
+    _frozenFile = null;
+    _frozenPixels = null;
     _frozenOpacity = 0.0;
     _pickPoint.value = null;
     _frozenMatrix.value = Matrix4.identity();
+    if (f != null) {
+      try {
+        await File(f.path).delete();
+      } catch (_) {}
+    }
     if (!mounted) return;
     setState(() {});
     _startStream();
@@ -340,13 +358,13 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
     if (p != null) _sampleFrozenAt(p);
   }
 
-  /// 在定格帧的 RGB 像素上，按取色点的屏幕坐标采样颜色。
-  /// 先去掉数字变焦矩阵，再按 BoxFit.cover 映射到定格图像素。
+  /// 在定格 JPEG 的 RGBA 像素上，按取色点的屏幕坐标采样颜色。
+  /// 先去掉数字变焦矩阵，再按 BoxFit.cover 映射到图像像素。
   void _sampleFrozenAt(Offset point) {
-    final frame = _frozenFrame;
-    if (frame == null || !mounted) return;
-    final bytes = frame.rgb;
-    final w = frame.width, h = frame.height;
+    final px = _frozenPixels;
+    if (px == null || !mounted) return;
+    final bytes = px.rgba;
+    final w = px.width, h = px.height;
     if (w == 0 || h == 0) return;
     // 先去掉数字变焦矩阵，再映射到定格图像素（cover）。
     final inv = Matrix4.inverted(_frozenMatrix.value);
@@ -362,7 +380,7 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
       if (y < 0 || y >= h) continue;
       for (var x = cx - 2; x <= cx + 2; x++) {
         if (x < 0 || x >= w) continue;
-        final o = (y * w + x) * 3;
+        final o = (y * w + x) * 4;
         if (o + 2 >= bytes.length) continue;
         r += bytes[o];
         g += bytes[o + 1];
@@ -424,7 +442,8 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
     _pickPoint.dispose();
     _frozenMatrix.dispose();
     _zoomBadge.dispose();
-    _frozenFrame = null;
+    _frozenFile = null;
+    _frozenPixels = null;
     final controller = _controller;
     _controller = null;
     if (controller != null) unawaited(_disposeController(controller));
@@ -450,12 +469,12 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
         extendBody: true,
         body: Stack(
           children: [
-            // 预览常驻底层；定格图是同一帧 YUV 数据渲染的 BMP，
-            // 在其上淡入——预览用例全程不被动过，绝不黑屏。
+            // 预览常驻底层；定格时 takePicture 的 JPEG 在其上淡入——
+            // 不调用 pausePreview/toImage，预览用例全程不被动过。
             Positioned.fill(
               child: _buildLive(controller),
             ),
-            if (frozen && _frozenFrame != null)
+            if (frozen && _frozenFile != null)
               Positioned.fill(
                 child: _buildFrozen(),
               ),
@@ -502,7 +521,8 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
                   );
                 },
               ),
-            // 缩放倍数指示（只重建徽标本身）
+            // 缩放倍数指示（只重建徽标本身）：与右上角闪光灯按钮垂直居中对齐
+            // （闪光灯 40 高、顶部 8；徽标放在同样的 40 高区域内居中）。
             ValueListenableBuilder<double?>(
               valueListenable: _zoomBadge,
               builder: (context, z, _) {
@@ -512,7 +532,15 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
                   left: 0,
                   right: 0,
                   child: SafeArea(
-                    child: Center(child: _ZoomBadge(zoom: z)),
+                    child: Padding(
+                      padding: const EdgeInsets.only(top: 8),
+                      child: Center(
+                        child: SizedBox(
+                          height: 40,
+                          child: Center(child: _ZoomBadge(zoom: z)),
+                        ),
+                      ),
+                    ),
                   ),
                 );
               },
@@ -576,12 +604,11 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
     );
   }
 
-  /// 定格画面：Image.memory 显示 BMP（纯 Dart 渲染+编码，无原生解码），
+  /// 定格画面：Image.file 直接显示 takePicture 的 JPEG（v0.3.0 验证过的路径），
   /// 淡入盖在实时预览上；单指拖动取色点，双指数值变焦。
-  /// 显示的就是取色用的同一帧，位置完全对齐。
   Widget _buildFrozen() {
-    final frame = _frozenFrame;
-    if (frame == null) return const SizedBox.shrink();
+    final file = _frozenFile;
+    if (file == null) return const SizedBox.shrink();
     return GestureDetector(
       onTapDown: _onFrozenTapDown,
       onPanUpdate: _onFrozenPanUpdate,
@@ -598,8 +625,8 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
             child: child,
           ),
           child: SizedBox.expand(
-            child: Image.memory(
-              frame.bmp,
+            child: Image.file(
+              File(file.path),
               fit: BoxFit.cover,
               gaplessPlayback: true,
             ),
@@ -608,6 +635,15 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
       ),
     );
   }
+}
+
+/// 定格 JPEG 后台解码出的 RGBA 像素（4 字节/像素），供拖动取色点采样。
+class _FrozenPixels {
+  const _FrozenPixels(this.rgba, this.width, this.height);
+
+  final Uint8List rgba;
+  final int width;
+  final int height;
 }
 
 /// 预览填满屏幕（cover 裁剪，不变形）。
