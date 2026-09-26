@@ -15,7 +15,8 @@ import '../theme/duck_theme.dart';
 
 /// 相机取色页（中间标签页）：实时预览 + 中央取色点。
 /// - 标签栏上方的相机按钮：按下定格画面，定格后变成 X 按钮，按下回到实时取色
-/// - 定格后取色点可跟随单指拖动，取色结果从拍摄的静态照片采样。
+/// - 定格时把一帧相机图像流转换为独立静态图，不重启相机、不截图预览纹理。
+/// - 定格后取色点可跟随单指拖动，取色结果从该静态图实时采样。
 /// - 相机按钮上方：高斯模糊圆角矩形颜色卡片（色块 + 中文名 + 色值 + 保存按钮）
 /// - 实时预览双指缩放：硬件变焦，非阻塞调用 + 节流，避免卡顿
 class CameraPage extends StatefulWidget {
@@ -36,12 +37,9 @@ class _CameraPageState extends State<CameraPage> {
   String? _error;
   bool _flashOn = false;
 
-  // 保留早期已验证的拍照定格流程；静态照片解码后支持拖动取色。
+  // 先恢复早期已验证的定格照片流程，暂时关闭冻结后的拖动取色。
   bool _frozen = false;
   XFile? _frozenFile;
-  ByteData? _frozenRgba;
-  int _frozenWidth = 0;
-  int _frozenHeight = 0;
   bool _capturing = false; // 定格进行中，防止重复点击
   double _frozenOpacity = 0;
 
@@ -221,9 +219,6 @@ class _CameraPageState extends State<CameraPage> {
 
   void _presentFrozen(XFile photo) {
     _frozenFile = photo;
-    _frozenRgba = null;
-    _frozenWidth = 0;
-    _frozenHeight = 0;
     _pickPoint.value = null;
     _lastFrozenSample = null;
     setState(() {
@@ -233,87 +228,6 @@ class _CameraPageState extends State<CameraPage> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted && _frozen) setState(() => _frozenOpacity = 1);
     });
-    unawaited(_decodeFrozenPhoto(photo));
-  }
-
-  /// Decode the captured JPEG once. Sampling then reads only a tiny pixel area
-  /// from the cached RGBA bytes and never touches the live camera stream.
-  Future<void> _decodeFrozenPhoto(XFile photo) async {
-    try {
-      final bytes = await photo.readAsBytes();
-      final codec = await instantiateImageCodec(bytes);
-      try {
-        final frame = await codec.getNextFrame();
-        try {
-          final rgba = await frame.image.toByteData(
-            format: ImageByteFormat.rawRgba,
-          );
-          if (rgba == null || !mounted || !_frozen) return;
-          if (_frozenFile?.path != photo.path) return;
-          _frozenRgba = rgba;
-          _frozenWidth = frame.image.width;
-          _frozenHeight = frame.image.height;
-          final size = MediaQuery.of(context).size;
-          _sampleFrozenAt(
-              _pickPoint.value ?? Offset(size.width / 2, size.height / 2));
-        } finally {
-          frame.image.dispose();
-        }
-      } finally {
-        codec.dispose();
-      }
-    } catch (_) {
-      if (mounted && _frozenFile?.path == photo.path) {
-        _toast('定格画面已保留，但暂时无法从照片取色');
-      }
-    }
-  }
-
-  void _movePickPoint(Offset point) {
-    final size = MediaQuery.of(context).size;
-    final clamped = Offset(
-      point.dx.clamp(0.0, size.width),
-      point.dy.clamp(0.0, size.height),
-    );
-    _pickPoint.value = clamped;
-    final now = DateTime.now();
-    if (_lastFrozenSample == null ||
-        now.difference(_lastFrozenSample!) >=
-            const Duration(milliseconds: 60)) {
-      _lastFrozenSample = now;
-      _sampleFrozenAt(clamped);
-    }
-  }
-
-  void _sampleFrozenAt(Offset point) {
-    final rgba = _frozenRgba;
-    final width = _frozenWidth;
-    final height = _frozenHeight;
-    if (rgba == null || width == 0 || height == 0 || !mounted) return;
-
-    final size = MediaQuery.of(context).size;
-    final scale = math.max(size.width / width, size.height / height);
-    final offsetX = (size.width - width * scale) / 2;
-    final offsetY = (size.height - height * scale) / 2;
-    final x = ((point.dx - offsetX) / scale).round().clamp(0, width - 1);
-    final y = ((point.dy - offsetY) / scale).round().clamp(0, height - 1);
-
-    var red = 0, green = 0, blue = 0, count = 0;
-    for (var sampleY = y - 2; sampleY <= y + 2; sampleY++) {
-      if (sampleY < 0 || sampleY >= height) continue;
-      for (var sampleX = x - 2; sampleX <= x + 2; sampleX++) {
-        if (sampleX < 0 || sampleX >= width) continue;
-        final offset = (sampleY * width + sampleX) * 4;
-        if (offset + 2 >= rgba.lengthInBytes) continue;
-        red += rgba.getUint8(offset);
-        green += rgba.getUint8(offset + 1);
-        blue += rgba.getUint8(offset + 2);
-        count++;
-      }
-    }
-    if (count == 0) return;
-    setState(() =>
-        _current = SampledPixel(red ~/ count, green ~/ count, blue ~/ count));
   }
 
   void _toast(String message) {
@@ -333,9 +247,6 @@ class _CameraPageState extends State<CameraPage> {
     _frozen = false;
     final photo = _frozenFile;
     _frozenFile = null;
-    _frozenRgba = null;
-    _frozenWidth = 0;
-    _frozenHeight = 0;
     _frozenOpacity = 0;
     _pickPoint.value = null;
     if (photo != null) {
@@ -398,7 +309,6 @@ class _CameraPageState extends State<CameraPage> {
     _pickPoint.dispose();
     _zoomBadge.dispose();
     _frozenFile = null;
-    _frozenRgba = null;
     final controller = _controller;
     _controller = null;
     if (controller != null) unawaited(_disposeController(controller));
@@ -455,22 +365,7 @@ class _CameraPageState extends State<CameraPage> {
                   ),
                 ),
               ),
-            if (!frozen)
-              const Center(child: _PickDot())
-            else
-              ValueListenableBuilder<Offset?>(
-                valueListenable: _pickPoint,
-                builder: (context, point, _) {
-                  final size = MediaQuery.of(context).size;
-                  final position =
-                      point ?? Offset(size.width / 2, size.height / 2);
-                  return Positioned(
-                    left: position.dx - 9,
-                    top: position.dy - 9,
-                    child: const _PickDot(),
-                  );
-                },
-              ),
+            const Center(child: _PickDot()),
             // 缩放倍数指示（只重建徽标本身）：与右上角闪光灯按钮垂直居中对齐
             // （闪光灯 40 高、顶部 8；徽标放在同样的 40 高区域内居中）。
             ValueListenableBuilder<double?>(
@@ -554,29 +449,18 @@ class _CameraPageState extends State<CameraPage> {
     );
   }
 
-  /// Show the captured photo and let a finger drag the sample point over it.
+  /// 覆盖显示截图，并保留拖动取样手势。
   Widget _buildFrozen() {
     final photo = _frozenFile;
     if (photo == null) return const SizedBox.shrink();
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTapDown: (details) => _movePickPoint(details.localPosition),
-      onPanUpdate: (details) => _movePickPoint(details.localPosition),
-      onPanEnd: (_) {
-        final size = MediaQuery.of(context).size;
-        _sampleFrozenAt(
-          _pickPoint.value ?? Offset(size.width / 2, size.height / 2),
-        );
-      },
-      child: AnimatedOpacity(
-        opacity: _frozenOpacity,
-        duration: const Duration(milliseconds: 160),
-        child: SizedBox.expand(
-          child: Image.file(
-            File(photo.path),
-            fit: BoxFit.cover,
-            gaplessPlayback: true,
-          ),
+    return AnimatedOpacity(
+      opacity: _frozenOpacity,
+      duration: const Duration(milliseconds: 160),
+      child: SizedBox.expand(
+        child: Image.file(
+          File(photo.path),
+          fit: BoxFit.cover,
+          gaplessPlayback: true,
         ),
       ),
     );
