@@ -1,14 +1,13 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math' as math;
 import 'dart:ui';
 
 import 'package:camera/camera.dart';
-import 'package:flutter/foundation.dart' show compute;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
-import '../camera/frame_renderer.dart';
 import '../camera/frame_sampler.dart';
 import '../models/picked_color.dart';
 import '../state/app_state.dart';
@@ -30,17 +29,19 @@ class CameraPage extends StatefulWidget {
   State<CameraPage> createState() => _CameraPageState();
 }
 
-class _CameraPageState extends State<CameraPage> {  CameraController? _controller;
+class _CameraPageState extends State<CameraPage> {
+  CameraController? _controller;
   CameraImage? _latestFrame;
   Timer? _sampleTimer;
   SampledPixel? _current;
   String? _error;
   bool _flashOn = false;
 
-  // 定格帧由相机图像流独立渲染，不依赖预览纹理或原生拍照接口。
+  // 先恢复早期已验证的定格照片流程，暂时关闭冻结后的拖动取色。
   bool _frozen = false;
-  FrozenFrame? _frozenFrame;
+  XFile? _frozenFile;
   bool _capturing = false; // 定格进行中，防止重复点击
+  double _frozenOpacity = 0;
 
   // 定格后取色点位置（屏幕坐标；null = 画面中心）
   final ValueNotifier<Offset?> _pickPoint = ValueNotifier<Offset?>(null);
@@ -191,28 +192,21 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
     }
   }
 
-  /// 从当前相机图像流复制一帧，在 worker isolate 中转成独立静态图。
+  /// 恢复 0.3.0 路径：停止采样定时器后直接 takePicture，显示 JPEG。
   Future<void> _freeze() async {
     final controller = _controller;
     if (controller == null || !controller.value.isInitialized) return;
     if (_frozen || _capturing) return;
-    final frame = _latestFrame;
-    if (frame == null) {
-      _toast('相机画面尚未准备好，请稍候再试');
-      return;
-    }
     _capturing = true;
+    _sampleTimer?.cancel();
+    _sampleTimer = null;
     try {
-      final frameData = copyCameraFrame(frame);
-      await _stopStream();
-      final frozenFrame = await compute(renderCameraFrame, frameData);
-      if (!mounted) return;
-      if (frozenFrame == null) {
-        _toast('无法处理当前相机画面，请重试');
-        _startStream();
-        return;
+      if (controller.value.isStreamingImages) {
+        unawaited(controller.stopImageStream().catchError((_) {}));
       }
-      _presentFrozen(frozenFrame);
+      final photo = await controller.takePicture();
+      if (!mounted) return;
+      _presentFrozen(photo);
     } catch (_) {
       if (mounted) {
         _toast('定格失败，请重试');
@@ -223,13 +217,17 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
     }
   }
 
-  void _presentFrozen(FrozenFrame frame) {
-    _frozenFrame = frame;
+  void _presentFrozen(XFile photo) {
+    _frozenFile = photo;
     _pickPoint.value = null;
     _lastFrozenSample = null;
-    setState(() => _frozen = true);
-    final size = MediaQuery.of(context).size;
-    _sampleFrozenAt(Offset(size.width / 2, size.height / 2));
+    setState(() {
+      _frozen = true;
+      _frozenOpacity = 0;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _frozen) setState(() => _frozenOpacity = 1);
+    });
   }
 
   void _toast(String message) {
@@ -247,8 +245,15 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
   Future<void> _unfreeze() async {
     if (!_frozen) return;
     _frozen = false;
-    _frozenFrame = null;
+    final photo = _frozenFile;
+    _frozenFile = null;
+    _frozenOpacity = 0;
     _pickPoint.value = null;
+    if (photo != null) {
+      try {
+        await File(photo.path).delete();
+      } catch (_) {}
+    }
     if (!mounted) return;
     setState(() {});
     _startStream();
@@ -272,74 +277,6 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
     _zoomHideTimer = Timer(const Duration(seconds: 1), () {
       _zoomBadge.value = null;
     });
-  }
-
-  // —— 定格后：单指拖动取色点 ——
-  void _movePickPoint(Offset localPosition) {
-    final size = MediaQuery.of(context).size;
-    final p = Offset(
-      localPosition.dx.clamp(0.0, size.width),
-      localPosition.dy.clamp(0.0, size.height),
-    );
-    _pickPoint.value = p;
-    // 采样节流：拖动时最高约 11Hz，避免频繁 setState。
-    final now = DateTime.now();
-    if (_lastFrozenSample == null ||
-        now.difference(_lastFrozenSample!) >
-            const Duration(milliseconds: 90)) {
-      _lastFrozenSample = now;
-      _sampleFrozenAt(p);
-    }
-  }
-
-  void _onFrozenPanUpdate(DragUpdateDetails details) {
-    _movePickPoint(details.localPosition);
-  }
-
-  void _onFrozenPanEnd(DragEndDetails details) {
-    // 抬手时按最终位置再采一次，保证准确。
-    final p = _pickPoint.value;
-    if (p != null) {
-      _lastFrozenSample = DateTime.now();
-      _sampleFrozenAt(p);
-    }
-  }
-
-  void _onFrozenTapDown(TapDownDetails details) {
-    _lastFrozenSample = DateTime.now();
-    _movePickPoint(details.localPosition);
-    final p = _pickPoint.value;
-    if (p != null) _sampleFrozenAt(p);
-  }
-
-  /// 从定格 RGB 帧采样取色点位置的颜色，按 BoxFit.cover 对齐显示坐标。
-  void _sampleFrozenAt(Offset point) {
-    final frame = _frozenFrame;
-    if (frame == null || !mounted) return;
-    final bytes = frame.rgb;
-    final w = frame.width, h = frame.height;
-    if (w == 0 || h == 0) return;
-    final size = MediaQuery.of(context).size;
-    final scale = math.max(size.width / w, size.height / h);
-    final offsetX = (size.width - w * scale) / 2;
-    final offsetY = (size.height - h * scale) / 2;
-    final cx = ((point.dx - offsetX) / scale).round().clamp(0, w - 1);
-    final cy = ((point.dy - offsetY) / scale).round().clamp(0, h - 1);
-    var r = 0, g = 0, b = 0, n = 0;
-    for (var y = cy - 2; y <= cy + 2; y++) {
-      if (y < 0 || y >= h) continue;
-      for (var x = cx - 2; x <= cx + 2; x++) {
-        if (x < 0 || x >= w) continue;
-        final o = (y * w + x) * 3;
-        if (o + 2 >= bytes.length) continue;
-        r += bytes[o];
-        g += bytes[o + 1];
-        b += bytes[o + 2];
-        n++;
-      }
-    }
-    if (n == 0) return;
-    setState(() => _current = SampledPixel(r ~/ n, g ~/ n, b ~/ n));
   }
 
   /// 保存当前颜色到取色历史。
@@ -371,7 +308,7 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
     _zoomHideTimer?.cancel();
     _pickPoint.dispose();
     _zoomBadge.dispose();
-    _frozenFrame = null;
+    _frozenFile = null;
     final controller = _controller;
     _controller = null;
     if (controller != null) unawaited(_disposeController(controller));
@@ -397,9 +334,9 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
         extendBody: true,
         body: Stack(
           children: [
-            // 定格图来自图像流帧，预览不参与截图或拍照，避免黑屏。
+            // 保持预览层常驻，早期 JPEG 照片显示在预览上层。
             Positioned.fill(child: _buildLive(controller)),
-            if (frozen && _frozenFrame != null)
+            if (frozen && _frozenFile != null)
               Positioned.fill(child: _buildFrozen()),
             if (_error != null)
               Positioned.fill(
@@ -428,22 +365,7 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
                   ),
                 ),
               ),
-            // 取色点：实时模式固定中央；定格后可拖动
-            if (!frozen)
-              const Center(child: _PickDot())
-            else
-              ValueListenableBuilder<Offset?>(
-                valueListenable: _pickPoint,
-                builder: (context, p, _) {
-                  final size = MediaQuery.of(context).size;
-                  final c = p ?? Offset(size.width / 2, size.height / 2);
-                  return Positioned(
-                    left: c.dx - 9,
-                    top: c.dy - 9,
-                    child: const _PickDot(),
-                  );
-                },
-              ),
+            const Center(child: _PickDot()),
             // 缩放倍数指示（只重建徽标本身）：与右上角闪光灯按钮垂直居中对齐
             // （闪光灯 40 高、顶部 8；徽标放在同样的 40 高区域内居中）。
             ValueListenableBuilder<double?>(
@@ -529,15 +451,14 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
 
   /// 覆盖显示截图，并保留拖动取样手势。
   Widget _buildFrozen() {
-    final frame = _frozenFrame;
-    if (frame == null) return const SizedBox.shrink();
-    return GestureDetector(
-      onTapDown: _onFrozenTapDown,
-      onPanUpdate: _onFrozenPanUpdate,
-      onPanEnd: _onFrozenPanEnd,
+    final photo = _frozenFile;
+    if (photo == null) return const SizedBox.shrink();
+    return AnimatedOpacity(
+      opacity: _frozenOpacity,
+      duration: const Duration(milliseconds: 160),
       child: SizedBox.expand(
-        child: Image.memory(
-          frame.bmp,
+        child: Image.file(
+          File(photo.path),
           fit: BoxFit.cover,
           gaplessPlayback: true,
         ),
@@ -625,9 +546,7 @@ class _ColorCard extends StatelessWidget {
                       p == null ? '--' : p.valueFor(state.displayFormat),
                       style: TextStyle(
                         fontSize: 14,
-                        color: dark
-                            ? Colors.white70
-                            : const Color(0xFF6B7280),
+                        color: dark ? Colors.white70 : const Color(0xFF6B7280),
                         fontFamily: 'monospace',
                         fontFamilyFallback: const ['Menlo', 'Consolas'],
                       ),
