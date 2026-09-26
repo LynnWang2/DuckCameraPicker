@@ -1,13 +1,14 @@
 import 'dart:async';
+import 'dart:math' as math;
 import 'dart:ui';
-import 'dart:ui' as ui;
 
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart' show compute;
 import 'package:flutter/material.dart';
-import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
+import '../camera/frame_renderer.dart';
 import '../camera/frame_sampler.dart';
 import '../models/picked_color.dart';
 import '../state/app_state.dart';
@@ -15,11 +16,8 @@ import '../theme/duck_theme.dart';
 
 /// 相机取色页（中间标签页）：实时预览 + 中央取色点。
 /// - 标签栏上方的相机按钮：按下定格画面，定格后变成 X 按钮，按下回到实时取色
-/// - 定格原理（v0.3.0 验证过的路径）：只停图像采样流，调用 takePicture 拍照，
-///   用 Image.file 直接显示 JPEG。绝不调用 pausePreview（它是黑屏的引入者，
-///   会暂停预览纹理），也不调用 toImage 截图。
-/// - 定格后：取色点可跟随单指拖动，取色结果实时变化（后台解码 JPEG 采样）；
-///   双指缩放定格图（数字变焦，矩阵手势驱动）
+/// - 定格时把一帧相机图像流转换为独立静态图，不重启相机、不截图预览纹理。
+/// - 定格后取色点可跟随单指拖动，取色结果从该静态图实时采样。
 /// - 相机按钮上方：高斯模糊圆角矩形颜色卡片（色块 + 中文名 + 色值 + 保存按钮）
 /// - 实时预览双指缩放：硬件变焦，非阻塞调用 + 节流，避免卡顿
 class CameraPage extends StatefulWidget {
@@ -39,14 +37,9 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
   String? _error;
   bool _flashOn = false;
 
-  // 定格画面取自当前 Flutter 预览帧。不要调用 takePicture：CameraX
-  // 拍照时会解绑 Preview 用例，导致预览纹理黑屏。
+  // 定格帧由相机图像流独立渲染，不依赖预览纹理或原生拍照接口。
   bool _frozen = false;
-  ui.Image? _frozenImage;
-  ByteData? _frozenRgba;
-  int _frozenW = 0;
-  int _frozenH = 0;
-  final GlobalKey _previewKey = GlobalKey();
+  FrozenFrame? _frozenFrame;
   bool _capturing = false; // 定格进行中，防止重复点击
 
   // 定格后取色点位置（屏幕坐标；null = 画面中心）
@@ -135,32 +128,38 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
     );
   }
 
-  void _stopStream() {
+  Future<void> _stopStream() async {
     _sampleTimer?.cancel();
     _sampleTimer = null;
+    _latestFrame = null;
     final controller = _controller;
     if (controller == null) return;
     try {
-      controller.stopImageStream();
+      if (controller.value.isStreamingImages) {
+        await controller.stopImageStream();
+      }
     } catch (_) {}
   }
 
   void _onBecameActive() {
     final controller = _controller;
     if (controller == null) return;
-    try {
-      controller.resumePreview();
-    } catch (_) {}
-    _startStream();
+    unawaited(controller.resumePreview().then((_) {
+      if (mounted && widget.active) _startStream();
+    }).catchError((_) {
+      if (mounted && widget.active) _startStream();
+    }));
   }
 
   void _onBecameInactive() {
-    _stopStream();
     final controller = _controller;
     if (controller == null) return;
-    try {
-      controller.pausePreview();
-    } catch (_) {}
+    unawaited(() async {
+      await _stopStream();
+      try {
+        await controller.pausePreview();
+      } catch (_) {}
+    }());
   }
 
   void _sample() {
@@ -192,54 +191,63 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
     }
   }
 
-  /// 定格当前预览帧，不调用原生拍照接口，因此相机预览纹理保持有效。
+  /// 从当前相机图像流复制一帧，在 worker isolate 中转成独立静态图。
   Future<void> _freeze() async {
     final controller = _controller;
     if (controller == null || !controller.value.isInitialized) return;
     if (_frozen || _capturing) return;
-    final boundary = _previewKey.currentContext?.findRenderObject()
-        as RenderRepaintBoundary?;
-    if (boundary == null || boundary.debugNeedsPaint) return;
+    final frame = _latestFrame;
+    if (frame == null) {
+      _toast('相机画面尚未准备好，请稍候再试');
+      return;
+    }
     _capturing = true;
-    _stopStream();
     try {
-      final pixelRatio =
-          MediaQuery.of(context).devicePixelRatio.clamp(1.0, 2.0).toDouble();
-      final image = await boundary.toImage(pixelRatio: pixelRatio);
-      final data = await image.toByteData(format: ui.ImageByteFormat.rawRgba);
-      if (!mounted || data == null) {
-        image.dispose();
+      final frameData = copyCameraFrame(frame);
+      await _stopStream();
+      final frozenFrame = await compute(renderCameraFrame, frameData);
+      if (!mounted) return;
+      if (frozenFrame == null) {
+        _toast('无法处理当前相机画面，请重试');
         _startStream();
         return;
       }
-      _frozenImage?.dispose();
-      _pickPoint.value = null;
-      _lastFrozenSample = null;
-      setState(() {
-        _frozen = true;
-        _frozenImage = image;
-        _frozenRgba = data;
-        _frozenW = image.width;
-        _frozenH = image.height;
-      });
-      final size = MediaQuery.of(context).size;
-      _sampleFrozenAt(Offset(size.width / 2, size.height / 2));
+      _presentFrozen(frozenFrame);
     } catch (_) {
-      if (mounted) _startStream();
+      if (mounted) {
+        _toast('定格失败，请重试');
+        _startStream();
+      }
     } finally {
       _capturing = false;
     }
+  }
+
+  void _presentFrozen(FrozenFrame frame) {
+    _frozenFrame = frame;
+    _pickPoint.value = null;
+    _lastFrozenSample = null;
+    setState(() => _frozen = true);
+    final size = MediaQuery.of(context).size;
+    _sampleFrozenAt(Offset(size.width / 2, size.height / 2));
+  }
+
+  void _toast(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        duration: const Duration(seconds: 2),
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
   }
 
   /// 回到实时取色并释放定格帧。
   Future<void> _unfreeze() async {
     if (!_frozen) return;
     _frozen = false;
-    _frozenImage?.dispose();
-    _frozenImage = null;
-    _frozenRgba = null;
-    _frozenW = 0;
-    _frozenH = 0;
+    _frozenFrame = null;
     _pickPoint.value = null;
     if (!mounted) return;
     setState(() {});
@@ -304,22 +312,25 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
     if (p != null) _sampleFrozenAt(p);
   }
 
-  /// 在定格预览帧的 RGBA 像素上，按取色点位置采样颜色。
+  /// 从定格 RGB 帧采样取色点位置的颜色，按 BoxFit.cover 对齐显示坐标。
   void _sampleFrozenAt(Offset point) {
-    final data = _frozenRgba;
-    if (data == null || !mounted) return;
-    final bytes = data.buffer.asUint8List();
-    final w = _frozenW, h = _frozenH;
+    final frame = _frozenFrame;
+    if (frame == null || !mounted) return;
+    final bytes = frame.rgb;
+    final w = frame.width, h = frame.height;
     if (w == 0 || h == 0) return;
     final size = MediaQuery.of(context).size;
-    final cx = (point.dx / size.width * w).round().clamp(0, w - 1);
-    final cy = (point.dy / size.height * h).round().clamp(0, h - 1);
+    final scale = math.max(size.width / w, size.height / h);
+    final offsetX = (size.width - w * scale) / 2;
+    final offsetY = (size.height - h * scale) / 2;
+    final cx = ((point.dx - offsetX) / scale).round().clamp(0, w - 1);
+    final cy = ((point.dy - offsetY) / scale).round().clamp(0, h - 1);
     var r = 0, g = 0, b = 0, n = 0;
     for (var y = cy - 2; y <= cy + 2; y++) {
       if (y < 0 || y >= h) continue;
       for (var x = cx - 2; x <= cx + 2; x++) {
         if (x < 0 || x >= w) continue;
-        final o = (y * w + x) * 4;
+        final o = (y * w + x) * 3;
         if (o + 2 >= bytes.length) continue;
         r += bytes[o];
         g += bytes[o + 1];
@@ -349,7 +360,7 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
 
   Future<void> _disposeController(CameraController c) async {
     try {
-      await c.stopImageStream();
+      if (c.value.isStreamingImages) await c.stopImageStream();
     } catch (_) {}
     await c.dispose();
   }
@@ -360,9 +371,7 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
     _zoomHideTimer?.cancel();
     _pickPoint.dispose();
     _zoomBadge.dispose();
-    _frozenImage?.dispose();
-    _frozenImage = null;
-    _frozenRgba = null;
+    _frozenFrame = null;
     final controller = _controller;
     _controller = null;
     if (controller != null) unawaited(_disposeController(controller));
@@ -388,14 +397,9 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
         extendBody: true,
         body: Stack(
           children: [
-            // 预览保持在底层，定格帧覆盖其上；相机预览纹理不会被拍照接口解绑。
-            Positioned.fill(
-              child: RepaintBoundary(
-                key: _previewKey,
-                child: _buildLive(controller),
-              ),
-            ),
-            if (frozen && _frozenImage != null)
+            // 定格图来自图像流帧，预览不参与截图或拍照，避免黑屏。
+            Positioned.fill(child: _buildLive(controller)),
+            if (frozen && _frozenFrame != null)
               Positioned.fill(child: _buildFrozen()),
             if (_error != null)
               Positioned.fill(
@@ -525,16 +529,17 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
 
   /// 覆盖显示截图，并保留拖动取样手势。
   Widget _buildFrozen() {
-    final image = _frozenImage;
-    if (image == null) return const SizedBox.shrink();
+    final frame = _frozenFrame;
+    if (frame == null) return const SizedBox.shrink();
     return GestureDetector(
       onTapDown: _onFrozenTapDown,
       onPanUpdate: _onFrozenPanUpdate,
       onPanEnd: _onFrozenPanEnd,
       child: SizedBox.expand(
-        child: RawImage(
-          image: image,
+        child: Image.memory(
+          frame.bmp,
           fit: BoxFit.cover,
+          gaplessPlayback: true,
         ),
       ),
     );
