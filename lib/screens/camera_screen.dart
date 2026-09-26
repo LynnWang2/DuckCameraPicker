@@ -7,7 +7,6 @@ import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
-import 'package:vector_math/vector_math_64.dart' show Matrix4, Vector3;
 
 import '../camera/frame_sampler.dart';
 import '../models/picked_color.dart';
@@ -47,17 +46,11 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
   bool _frozen = false;
   XFile? _frozenFile;
   _FrozenPixels? _frozenPixels;
-  double _frozenOpacity = 0.0;
   bool _capturing = false; // 定格进行中，防止重复点击
 
   // 定格后取色点位置（屏幕坐标；null = 画面中心）
   final ValueNotifier<Offset?> _pickPoint = ValueNotifier<Offset?>(null);
   DateTime? _lastFrozenSample;
-
-  // 定格图数字变焦矩阵（手势直接驱动，不重建整棵树）
-  final ValueNotifier<Matrix4> _frozenMatrix =
-      ValueNotifier<Matrix4>(Matrix4.identity());
-  Matrix4 _frozenBaseMatrix = Matrix4.identity();
 
   // 实时预览缩放
   double _minZoom = 1.0;
@@ -247,25 +240,14 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
     }
   }
 
-  /// 显示定格图：淡入。调用前已保证 mounted。
+  /// 显示定格图。调用前已保证 mounted。
   void _presentFrozen(XFile file) {
     if (!mounted) return;
     _frozenFile = file;
     _frozenPixels = null;
-    _frozenBaseMatrix = Matrix4.identity();
-    _frozenMatrix.value = Matrix4.identity();
     _pickPoint.value = null;
     _lastFrozenSample = null;
-    setState(() {
-      _frozen = true;
-      _frozenOpacity = 0.0;
-    });
-    // 下一帧开始淡入。
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted && _frozen) {
-        setState(() => _frozenOpacity = 1.0);
-      }
-    });
+    setState(() => _frozen = true);
     // JPEG 解码完成后（_decodeFrozen）再按中心点采样。
   }
 
@@ -287,9 +269,7 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
     final f = _frozenFile;
     _frozenFile = null;
     _frozenPixels = null;
-    _frozenOpacity = 0.0;
     _pickPoint.value = null;
-    _frozenMatrix.value = Matrix4.identity();
     if (f != null) {
       try {
         await File(f.path).delete();
@@ -359,22 +339,19 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
   }
 
   /// 在定格 JPEG 的 RGBA 像素上，按取色点的屏幕坐标采样颜色。
-  /// 先去掉数字变焦矩阵，再按 BoxFit.cover 映射到图像像素。
+  /// 按 BoxFit.cover 映射到图像像素。
   void _sampleFrozenAt(Offset point) {
     final px = _frozenPixels;
     if (px == null || !mounted) return;
     final bytes = px.rgba;
     final w = px.width, h = px.height;
     if (w == 0 || h == 0) return;
-    // 先去掉数字变焦矩阵，再映射到定格图像素（cover）。
-    final inv = Matrix4.inverted(_frozenMatrix.value);
-    final s = inv.transform3(Vector3(point.dx, point.dy, 0));
     final size = MediaQuery.of(context).size;
     final scale = math.max(size.width / w, size.height / h);
     final ox = (size.width - w * scale) / 2;
     final oy = (size.height - h * scale) / 2;
-    final cx = ((s.x - ox) / scale).round().clamp(0, w - 1);
-    final cy = ((s.y - oy) / scale).round().clamp(0, h - 1);
+    final cx = ((point.dx - ox) / scale).round().clamp(0, w - 1);
+    final cy = ((point.dy - oy) / scale).round().clamp(0, h - 1);
     var r = 0, g = 0, b = 0, n = 0;
     for (var y = cy - 2; y <= cy + 2; y++) {
       if (y < 0 || y >= h) continue;
@@ -390,26 +367,6 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
     }
     if (n == 0) return;
     setState(() => _current = SampledPixel(r ~/ n, g ~/ n, b ~/ n));
-  }
-
-  // —— 定格图双指缩放：数字变焦，矩阵手势直接驱动 ——
-  void _onFrozenScaleStart(ScaleStartDetails details) {
-    _frozenBaseMatrix = _frozenMatrix.value.clone();
-  }
-
-  void _onFrozenScaleUpdate(ScaleUpdateDetails details) {
-    if ((details.scale - 1.0).abs() < 0.002) return;
-    final base = _frozenBaseMatrix;
-    final baseScale = base.getMaxScaleOnAxis();
-    final targetScale = (baseScale * details.scale).clamp(1.0, 5.0);
-    final s = targetScale / baseScale;
-    final f = details.localFocalPoint;
-    final m = Matrix4.identity()
-      ..translateByDouble(f.dx, f.dy, 0.0, 1.0)
-      ..scaleByDouble(s, s, 1.0, 1.0)
-      ..translateByDouble(-f.dx, -f.dy, 0.0, 1.0);
-    m.multiply(base);
-    _frozenMatrix.value = m;
   }
 
   /// 保存当前颜色到取色历史。
@@ -440,7 +397,6 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
     _sampleTimer?.cancel();
     _zoomHideTimer?.cancel();
     _pickPoint.dispose();
-    _frozenMatrix.dispose();
     _zoomBadge.dispose();
     _frozenFile = null;
     _frozenPixels = null;
@@ -469,15 +425,13 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
         extendBody: true,
         body: Stack(
           children: [
-            // 预览常驻底层；定格时 takePicture 的 JPEG 在其上淡入——
-            // 不调用 pausePreview/toImage，预览用例全程不被动过。
+            // 定格时直接用 JPEG 替换预览（v0.3.0 一模一样的显示方式），
+            // 不叠加、不淡入。手势只保留拖动取色点。
             Positioned.fill(
-              child: _buildLive(controller),
+              child: (frozen && _frozenFile != null)
+                  ? _buildFrozenV030()
+                  : _buildLive(controller),
             ),
-            if (frozen && _frozenFile != null)
-              Positioned.fill(
-                child: _buildFrozen(),
-              ),
             if (_error != null)
               Positioned.fill(
                 child: Container(
@@ -604,33 +558,19 @@ class _CameraPageState extends State<CameraPage> {  CameraController? _controlle
     );
   }
 
-  /// 定格画面：Image.file 直接显示 takePicture 的 JPEG（v0.3.0 验证过的路径），
-  /// 淡入盖在实时预览上；单指拖动取色点，双指数值变焦。
-  Widget _buildFrozen() {
+  /// 定格画面：v0.3.0 一模一样的显示——Image.file 直接替换预览，
+  /// 不叠加、不淡入、不 Transform。只包一层手势做拖动取色点。
+  Widget _buildFrozenV030() {
     final file = _frozenFile;
     if (file == null) return const SizedBox.shrink();
     return GestureDetector(
       onTapDown: _onFrozenTapDown,
       onPanUpdate: _onFrozenPanUpdate,
       onPanEnd: _onFrozenPanEnd,
-      onScaleStart: _onFrozenScaleStart,
-      onScaleUpdate: _onFrozenScaleUpdate,
-      child: AnimatedOpacity(
-        opacity: _frozenOpacity,
-        duration: const Duration(milliseconds: 160),
-        child: ValueListenableBuilder<Matrix4>(
-          valueListenable: _frozenMatrix,
-          builder: (context, m, child) => Transform(
-            transform: m,
-            child: child,
-          ),
-          child: SizedBox.expand(
-            child: Image.file(
-              File(file.path),
-              fit: BoxFit.cover,
-              gaplessPlayback: true,
-            ),
-          ),
+      child: SizedBox.expand(
+        child: Image.file(
+          File(file.path),
+          fit: BoxFit.cover,
         ),
       ),
     );
